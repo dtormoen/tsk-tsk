@@ -85,6 +85,7 @@ fn row_to_task(row: &rusqlite::Row) -> rusqlite::Result<Task> {
                 )
             })?,
         branch_name: row.get("branch_name")?,
+        target_branch: row.get("target_branch")?,
         error_message: row.get("error_message")?,
         source_commit: row.get("source_commit")?,
         source_branch: row.get("source_branch")?,
@@ -139,7 +140,7 @@ fn insert_task(
         .map(|p| path_to_string(p))
         .transpose()?;
     conn.execute(
-        "INSERT INTO tasks (id, repo_root, name, task_type, instructions_file, agent, status, created_at, started_at, completed_at, branch_name, error_message, source_commit, source_branch, stack, project, copied_repo_path, is_interactive, parent_ids, network_isolation, dind, resolved_config) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
+        "INSERT INTO tasks (id, repo_root, name, task_type, instructions_file, agent, status, created_at, started_at, completed_at, branch_name, target_branch, error_message, source_commit, source_branch, stack, project, copied_repo_path, is_interactive, parent_ids, network_isolation, dind, resolved_config) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
         rusqlite::params![
             task.id,
             repo_root,
@@ -152,6 +153,7 @@ fn insert_task(
             task.started_at.map(|dt| dt.to_rfc3339()),
             task.completed_at.map(|dt| dt.to_rfc3339()),
             task.branch_name,
+            task.target_branch,
             task.error_message,
             task.source_commit,
             task.source_branch,
@@ -313,6 +315,9 @@ impl TaskStorage {
 
         // Migration: add resolved_config column for config snapshotting
         let _ = conn.execute_batch("ALTER TABLE tasks ADD COLUMN resolved_config TEXT;");
+
+        // Migration: add target_branch column for branch targeting
+        let _ = conn.execute_batch("ALTER TABLE tasks ADD COLUMN target_branch TEXT;");
 
         if let Some(data_dir) = db_path.parent() {
             migrate_from_json(&conn, data_dir);
@@ -706,6 +711,33 @@ mod tests {
         );
         assert!(retrieved.is_interactive);
         assert_eq!(retrieved.parent_ids, vec!["parent5678".to_string()]);
+        assert_eq!(retrieved.target_branch, None);
+    }
+
+    #[tokio::test]
+    async fn test_target_branch_round_trip() {
+        let ctx = AppContext::builder().build();
+        let tsk_env = ctx.tsk_env();
+
+        let db_path = tsk_env.data_dir().join("test_target_branch.db");
+        let storage = TaskStorage::new(db_path).unwrap();
+
+        let task = Task {
+            id: "target1234".to_string(),
+            repo_root: tsk_env.data_dir().to_path_buf(),
+            branch_name: "feature/my-branch".to_string(),
+            target_branch: Some("feature/my-branch".to_string()),
+            copied_repo_path: Some(tsk_env.data_dir().to_path_buf()),
+            ..Task::test_default()
+        };
+        storage.add_task(task).await.unwrap();
+
+        let retrieved = storage.get_task("target1234").await.unwrap().unwrap();
+        assert_eq!(
+            retrieved.target_branch,
+            Some("feature/my-branch".to_string())
+        );
+        assert_eq!(retrieved.branch_name, "feature/my-branch");
     }
 
     #[tokio::test]

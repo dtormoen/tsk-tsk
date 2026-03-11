@@ -77,6 +77,11 @@ pub struct Task {
     pub completed_at: Option<DateTime<Utc>>,
     /// Git branch name for this task (format: tsk/{task-id})
     pub branch_name: String,
+    /// Optional target branch name to use instead of auto-generated branch.
+    /// When set, the task attempts to push to this branch. Falls back to
+    /// the auto-generated name if the push fails (e.g., non-fast-forward).
+    #[serde(default)]
+    pub target_branch: Option<String>,
     /// Error message if task failed
     pub error_message: Option<String>,
     /// Git commit SHA from which the task was created
@@ -131,6 +136,7 @@ impl Task {
         instructions_file: String,
         agent: String,
         branch_name: String,
+        target_branch: Option<String>,
         source_commit: String,
         source_branch: Option<String>,
         stack: String,
@@ -155,6 +161,7 @@ impl Task {
             started_at: None,
             completed_at: None,
             branch_name,
+            target_branch,
             error_message: None,
             source_commit,
             source_branch,
@@ -167,6 +174,16 @@ impl Task {
             dind,
             resolved_config,
         }
+    }
+
+    /// Returns the auto-generated branch name for this task.
+    ///
+    /// This is the standard `tsk/{type}/{name}/{id}` format, computed
+    /// deterministically from existing task fields.
+    pub fn generated_branch_name(&self) -> String {
+        let sanitized_type = crate::utils::sanitize_for_branch_name(&self.task_type);
+        let sanitized_name = crate::utils::sanitize_for_branch_name(&self.name);
+        format!("tsk/{sanitized_type}/{sanitized_name}/{}", self.id)
     }
 }
 
@@ -193,6 +210,7 @@ impl Task {
             started_at: None,
             completed_at: None,
             branch_name: "tsk/feat/test-task/test-id".to_string(),
+            target_branch: None,
             error_message: None,
             source_commit: "abc123".to_string(),
             source_branch: Some("main".to_string()),
@@ -278,6 +296,12 @@ mod tests {
         assert_eq!(task.parent_ids, vec!["parent-id"]);
         assert!(task.copied_repo_path.is_none());
         assert!(task.source_branch.is_none());
+    }
+
+    #[test]
+    fn test_generated_branch_name() {
+        let task = Task::test_default();
+        assert_eq!(task.generated_branch_name(), "tsk/feat/test-task/test-id");
     }
 
     #[test]

@@ -3,10 +3,12 @@ use crate::agent::log_line::LogLine;
 use crate::agent::task_logger::TaskLogger;
 use crate::context::AppContext;
 use crate::context::TaskStorage;
+use crate::context::tsk_config::ResolvedConfig;
 use crate::docker::{DockerManager, image_manager::DockerImageManager};
-use crate::git::RepoManager;
+use crate::git::{FetchResult, RepoManager};
 use crate::task::{Task, TaskStatus};
 use crate::tui::events::{ServerEvent, ServerEventSender, emit_or_print};
+use std::path::Path;
 use std::sync::Arc;
 
 /// Result of executing a task
@@ -281,7 +283,8 @@ impl TaskRunner {
             task.repo_root.display(),
             branch_name,
         )));
-        match self
+        let mut actual_branch_name = branch_name.clone();
+        let fetch_result = self
             .repo_manager
             .fetch_changes(
                 repo_path,
@@ -291,28 +294,40 @@ impl TaskRunner {
                 task.source_branch.as_deref(),
                 resolved_config.git_town,
             )
-            .await
-        {
-            Ok(result) => {
-                for warning in &result.warnings {
-                    task_logger.log(LogLine::tsk_warning(warning.clone()));
-                }
-                if result.has_changes {
-                    task_logger.log(LogLine::tsk_success(format!(
-                        "Branch {branch_name} is now available"
-                    )));
-                } else {
-                    task_logger.log(LogLine::tsk_message("No changes - branch not created"));
-                }
+            .await;
+
+        let fetch_result = match fetch_result {
+            Ok(result) => Some(result),
+            Err(e) if task.target_branch.is_some() => {
+                // Target branch fetch failed (likely non-fast-forward), try fallback
+                self.fetch_with_fallback_branch(task, repo_path, &resolved_config, &task_logger, &e)
+                    .await
             }
             Err(e) => {
                 task_logger.log(LogLine::tsk_warning(format!("Error fetching changes: {e}")));
+                None
+            }
+        };
+
+        if let Some(result) = fetch_result {
+            for warning in &result.warnings {
+                task_logger.log(LogLine::tsk_warning(warning.clone()));
+            }
+            if result.has_changes {
+                if let Some(ref name) = result.branch_name {
+                    actual_branch_name = name.clone();
+                }
+                task_logger.log(LogLine::tsk_success(format!(
+                    "Branch {actual_branch_name} is now available"
+                )));
+            } else {
+                task_logger.log(LogLine::tsk_message("No changes - branch not created"));
             }
         }
 
         if task_result.success {
             Ok(TaskExecutionResult {
-                branch_name,
+                branch_name: actual_branch_name,
                 message: task_result.message,
             })
         } else {
@@ -320,6 +335,63 @@ impl TaskRunner {
                 message: task_result.message,
                 is_warmup_failure: false,
             })
+        }
+    }
+
+    /// Attempt to fetch task changes using the auto-generated fallback branch name.
+    /// Called when the initial fetch with a target_branch fails (e.g. non-fast-forward).
+    async fn fetch_with_fallback_branch(
+        &self,
+        task: &Task,
+        repo_path: &Path,
+        resolved_config: &ResolvedConfig,
+        task_logger: &TaskLogger,
+        original_error: &str,
+    ) -> Option<FetchResult> {
+        let fallback_name = task.generated_branch_name();
+        task_logger.log(LogLine::tsk_warning(format!(
+            "Target branch failed ({original_error}), falling back to {fallback_name}"
+        )));
+
+        let commit = match crate::git_operations::get_current_commit(repo_path).await {
+            Ok(c) => c,
+            Err(e) => {
+                task_logger.log(LogLine::tsk_warning(format!(
+                    "Failed to get current commit for fallback: {e}"
+                )));
+                return None;
+            }
+        };
+
+        if let Err(e) =
+            crate::git_operations::create_branch_from_commit(repo_path, &fallback_name, &commit)
+                .await
+        {
+            task_logger.log(LogLine::tsk_warning(format!(
+                "Failed to create fallback branch: {e}"
+            )));
+            return None;
+        }
+
+        match self
+            .repo_manager
+            .fetch_changes(
+                repo_path,
+                &fallback_name,
+                &task.repo_root,
+                &task.source_commit,
+                task.source_branch.as_deref(),
+                resolved_config.git_town,
+            )
+            .await
+        {
+            Ok(result) => Some(result),
+            Err(e) => {
+                task_logger.log(LogLine::tsk_warning(format!(
+                    "Fallback fetch also failed: {e}"
+                )));
+                None
+            }
         }
     }
 }

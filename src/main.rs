@@ -458,6 +458,7 @@ async fn main() {
                     repo,
                     no_network_isolation,
                     dind,
+                    target_branch: None,
                 },
                 parent_id,
             })
@@ -494,6 +495,7 @@ async fn main() {
                     repo,
                     no_network_isolation,
                     dind,
+                    target_branch: None,
                 },
                 docker_client_override: None,
             })
@@ -530,6 +532,7 @@ async fn main() {
                     repo,
                     no_network_isolation,
                     dind,
+                    target_branch: None,
                 },
             })
         }

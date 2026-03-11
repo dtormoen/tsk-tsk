@@ -8,6 +8,8 @@ use std::path::{Path, PathBuf};
 pub struct FetchResult {
     /// Whether the branch has new commits compared to the base.
     pub has_changes: bool,
+    /// The actual branch name used, set when `has_changes` is true.
+    pub branch_name: Option<String>,
     /// Non-fatal warnings encountered during the fetch (e.g. submodule or git-town issues).
     pub warnings: Vec<String>,
 }
@@ -564,6 +566,7 @@ impl RepoManager {
         if current_head == source_commit {
             return Ok(FetchResult {
                 has_changes: false,
+                branch_name: None,
                 warnings: vec![],
             });
         }
@@ -671,6 +674,11 @@ impl RepoManager {
 
         Ok(FetchResult {
             has_changes: has_commits,
+            branch_name: if has_commits {
+                Some(branch_name.to_string())
+            } else {
+                None
+            },
             warnings,
         })
     }

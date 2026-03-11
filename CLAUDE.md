@@ -80,5 +80,5 @@ For user-facing breaking changes, add `!` after the type (e.g., `feat!:`, `fix!:
 
 ### Branch and Task Conventions
 
-- Tasks create branches: `tsk/{task-type}/{task-name}/{task-id}` (e.g., `tsk/feat/add-user-auth/a1b2c3d4`)
+- Tasks create branches: `tsk/{task-type}/{task-name}/{task-id}` (e.g., `tsk/feat/add-user-auth/a1b2c3d4`) by default. When `target_branch` is set, the task reuses that branch name instead (falling back to the generated name on non-fast-forward).
 - Templates support YAML-style frontmatter (`---` delimited) with a `description` field shown in `tsk template list`. Frontmatter is stripped before content reaches agents.
