@@ -150,6 +150,9 @@ impl TskConfig {
         if let Some(ref squid_conf) = config.squid_conf {
             resolved.squid_conf = Some(squid_conf.clone());
         }
+        if let Some(ref review_command) = config.review_command {
+            resolved.review_command = Some(review_command.clone());
+        }
 
         // host_ports: combine, deduplicate
         for &port in &config.host_ports {
@@ -256,6 +259,8 @@ pub struct SharedConfig {
     pub squid_conf: Option<String>,
     /// Path to a Squid proxy configuration file
     pub squid_conf_path: Option<String>,
+    /// Command to open review files (placeholders: `{{base}}`, `{{version}}`, `{{review_file}}`)
+    pub review_command: Option<String>,
 }
 
 /// Per-stack configuration (e.g., custom Dockerfile setup commands)
@@ -306,6 +311,8 @@ pub struct ResolvedConfig {
     pub env: Vec<EnvVar>,
     /// Resolved Squid proxy configuration content
     pub squid_conf: Option<String>,
+    /// Command to open review files (placeholders: `{{base}}`, `{{version}}`, `{{review_file}}`)
+    pub review_command: Option<String>,
 }
 
 impl Default for ResolvedConfig {
@@ -324,6 +331,7 @@ impl Default for ResolvedConfig {
             volumes: Vec::new(),
             env: Vec::new(),
             squid_conf: None,
+            review_command: None,
         }
     }
 }
@@ -1718,6 +1726,7 @@ setup = "RUN pip install numpy"
                 value: "postgres://localhost/db".to_string(),
             }],
             squid_conf: Some("http_port 3128".to_string()),
+            review_command: Some("vim {{review_file}}".to_string()),
         };
 
         let json = serde_json::to_string(&config).unwrap();
@@ -1744,6 +1753,10 @@ setup = "RUN pip install numpy"
         assert_eq!(deserialized.env.len(), 1);
         assert_eq!(deserialized.env[0].name, "DB_URL");
         assert_eq!(deserialized.squid_conf, Some("http_port 3128".to_string()));
+        assert_eq!(
+            deserialized.review_command,
+            Some("vim {{review_file}}".to_string())
+        );
     }
 
     #[test]
@@ -2092,5 +2105,47 @@ setup = "RUN pip install numpy"
             ..Default::default()
         };
         assert_eq!(resolve_agent(None, &resolved), "codex");
+    }
+
+    #[test]
+    fn test_resolve_config_review_command() {
+        let config = TskConfig {
+            defaults: SharedConfig {
+                review_command: Some("vim {{review_file}}".to_string()),
+                ..Default::default()
+            },
+            project: HashMap::from([(
+                "my-project".to_string(),
+                SharedConfig {
+                    review_command: Some("code {{review_file}}".to_string()),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+
+        // Defaults apply when no project match
+        let resolved_other = config.resolve_config("other-project", None, None);
+        assert_eq!(
+            resolved_other.review_command,
+            Some("vim {{review_file}}".to_string())
+        );
+
+        // Project-level config overrides defaults
+        let project_config = SharedConfig {
+            review_command: Some("nano {{review_file}}".to_string()),
+            ..Default::default()
+        };
+        let resolved_project = config.resolve_config("my-project", Some(&project_config), None);
+        // User [project.<name>] overrides project-level config
+        assert_eq!(
+            resolved_project.review_command,
+            Some("code {{review_file}}".to_string())
+        );
+
+        // None by default
+        let default_config = TskConfig::default();
+        let resolved_default = default_config.resolve_config("any", None, None);
+        assert!(resolved_default.review_command.is_none());
     }
 }

@@ -188,6 +188,7 @@ Create, manage, and monitor tasks assigned to AI agents.
 - `tsk clean` - Clean up completed tasks
 - `tsk delete <task-id>...` - Delete one or more tasks
 - `tsk retry <task-id>...` - Retry one or more tasks
+- `tsk review <task-id>` - Open a completed task's changes for review (coming soon)
 
 ### Server Commands
 
@@ -262,6 +263,7 @@ memory_gb = 12.0             # Container memory limit in GB
 cpu = 8                      # Number of CPUs
 dind = false                 # Enable Docker-in-Docker support
 git_town = false             # Enable git-town parent branch tracking
+# review_command = "vim {{review_file}}"  # Command to open review files (placeholders: {{base}}, {{version}}, {{review_file}})
 
 # Project-specific overrides (matches directory name)
 [project.my-go-service]

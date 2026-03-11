@@ -189,6 +189,15 @@ mod tests {
         let templates = list_all_templates(None, &ctx.tsk_env());
         assert!(templates.contains(&"feat".to_string()));
         assert!(templates.contains(&"fix".to_string()));
+        assert!(templates.contains(&"tsk-review".to_string()));
+    }
+
+    #[test]
+    fn test_find_template_tsk_review() {
+        let ctx = AppContext::builder().build();
+        let result = find_template("tsk-review", None, &ctx.tsk_env());
+        assert!(result.is_ok());
+        assert!(result.unwrap().contains("{{PROMPT}}"));
     }
 
     #[test]
