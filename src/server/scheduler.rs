@@ -1446,4 +1446,36 @@ mod tests {
             "Child task should be marked as cancelled when parent is cancelled"
         );
     }
+
+    #[test]
+    fn test_precopied_child_is_ready_for_scheduling() {
+        // A child task with pre-copied repo (skip_parent_repo_deferral) should be
+        // ready for scheduling when its parent is complete, and the scheduler's
+        // preparation block (line 555) should be skipped since copied_repo_path is set.
+        let parent_task = Task {
+            id: "parent-1".to_string(),
+            name: "parent-task".to_string(),
+            branch_name: "tsk/test/parent-1".to_string(),
+            status: TaskStatus::Complete,
+            ..Task::test_default()
+        };
+
+        let child_task = Task {
+            id: "child-1".to_string(),
+            name: "review-task".to_string(),
+            branch_name: "tsk/test/child-1".to_string(),
+            source_branch: Some("main".to_string()),
+            copied_repo_path: Some(std::path::PathBuf::from("/tmp/precopied")),
+            parent_ids: vec!["parent-1".to_string()],
+            ..Task::test_default()
+        };
+
+        let all_tasks = vec![parent_task, child_task.clone()];
+        let submitted = HashSet::new();
+
+        assert!(
+            TaskScheduler::is_task_ready_for_scheduling(&child_task, &all_tasks, &submitted),
+            "Pre-copied child with complete parent should be ready"
+        );
+    }
 }

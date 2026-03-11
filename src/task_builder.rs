@@ -43,6 +43,10 @@ pub struct TaskBuilder {
     dind: Option<bool>,
     repo_copy_source: Option<PathBuf>,
     target_branch: Option<String>,
+    /// When true, tasks with a parent_id will copy the repo at creation time
+    /// instead of deferring to the scheduler. Used for review tasks where the
+    /// parent is already complete.
+    skip_parent_repo_deferral: bool,
 }
 
 impl TaskBuilder {
@@ -66,6 +70,7 @@ impl TaskBuilder {
             dind: None,
             repo_copy_source: None,
             target_branch: None,
+            skip_parent_repo_deferral: false,
         }
     }
 
@@ -191,6 +196,15 @@ impl TaskBuilder {
     /// Falls back to the generated name if the target branch push fails.
     pub fn target_branch(mut self, target: Option<String>) -> Self {
         self.target_branch = target;
+        self
+    }
+
+    /// When true, tasks with a parent_id copy the repo at creation time instead
+    /// of deferring to the scheduler. The parent's resolved config is inherited.
+    /// Gated to `cfg(test)` until the review command is implemented.
+    #[cfg(test)]
+    pub fn skip_parent_repo_deferral(mut self, skip: bool) -> Self {
+        self.skip_parent_repo_deferral = skip;
         self
     }
 
@@ -381,14 +395,13 @@ impl TaskBuilder {
         let generated_branch = format!("tsk/{sanitized_task_type}/{sanitized_name}/{id}");
         let branch_name = self.target_branch.clone().unwrap_or(generated_branch);
 
-        // Validate parent task if specified
-        if let Some(ref pid) = self.parent_id {
+        // Validate parent task if specified and capture it for later use
+        let validated_parent = if let Some(ref pid) = self.parent_id {
             let storage = ctx.task_storage();
             let tasks = storage.list_tasks().await.map_err(|e| e.to_string())?;
 
             // Check if parent task exists
-            let parent_task = tasks.iter().find(|t| t.id == *pid);
-            if parent_task.is_none() {
+            if !tasks.iter().any(|t| t.id == *pid) {
                 return Err(format!(
                     "Parent task '{}' not found. Please specify a valid task ID.",
                     pid
@@ -418,14 +431,20 @@ impl TaskBuilder {
                     .find(|t| t.id == check_id)
                     .and_then(|t| t.parent_ids.first().cloned());
             }
-        }
 
-        // Determine if this task has a parent
+            // Capture the parent task for config inheritance
+            Some(tasks.into_iter().find(|t| t.id == *pid).unwrap())
+        } else {
+            None
+        };
+
+        // Determine if this task has a parent and whether to defer repo setup
         let has_parent = self.parent_id.is_some();
+        let defer_to_scheduler = has_parent && !self.skip_parent_repo_deferral;
 
-        // Copy the repository for the task (unless it has a parent)
-        // Tasks with parents skip repo copy - they'll get it from the parent when scheduled
-        let copied_repo_path = if has_parent {
+        // Copy the repository for the task (unless deferred to scheduler)
+        // Tasks deferred to the scheduler skip repo copy - they'll get it from the parent
+        let copied_repo_path = if defer_to_scheduler {
             // Skip repo copy for child tasks - the scheduler will copy from parent task
             None
         } else {
@@ -446,14 +465,37 @@ impl TaskBuilder {
             Some(copy_result.repo_path)
         };
 
-        // For child tasks, source_branch is set to None - it will be set from parent task later
-        let effective_source_branch = if has_parent { None } else { source_branch };
+        // For deferred child tasks, source_branch is set to None - it will be set from parent later
+        let effective_source_branch = if defer_to_scheduler {
+            None
+        } else {
+            source_branch
+        };
 
-        // Serialize the resolved config for snapshotting in the database.
-        // This captures the full config at task creation time so execution
-        // doesn't need to rediscover project files.
-        let resolved_config_json = serde_json::to_string(&resolved)
-            .map_err(|e| format!("Failed to serialize resolved config: {e}"))?;
+        // Snapshot resolved config. Review tasks inherit the parent's config so the
+        // review agent runs with the same stack, agent, volumes, env, etc.
+        let resolved_config_json = if self.skip_parent_repo_deferral {
+            if let Some(ref parent) = validated_parent {
+                match &parent.resolved_config {
+                    Some(config) => config.clone(),
+                    None => {
+                        eprintln!(
+                            "Warning: Parent task '{}' has no resolved_config snapshot, \
+                             using current config instead",
+                            parent.id
+                        );
+                        serde_json::to_string(&resolved)
+                            .map_err(|e| format!("Failed to serialize resolved config: {e}"))?
+                    }
+                }
+            } else {
+                serde_json::to_string(&resolved)
+                    .map_err(|e| format!("Failed to serialize resolved config: {e}"))?
+            }
+        } else {
+            serde_json::to_string(&resolved)
+                .map_err(|e| format!("Failed to serialize resolved config: {e}"))?
+        };
 
         // Create and return the task
         let task = Task::new(
@@ -1512,6 +1554,111 @@ mod tests {
             config.host_ports,
             vec![5432],
             "Project config host_ports should be in snapshot"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_task_builder_skip_parent_repo_deferral_copies_repo() {
+        use crate::test_utils::TestGitRepository;
+
+        let test_repo = TestGitRepository::new().unwrap();
+        test_repo.init_with_commit().unwrap();
+        let repo_path = test_repo.path().to_path_buf();
+
+        let ctx = AppContext::builder().build();
+
+        // Create and store a parent task
+        let parent_task = TaskBuilder::new()
+            .repo_root(repo_path.clone())
+            .name("parent-task".to_string())
+            .prompt(Some("Parent task".to_string()))
+            .build(&ctx)
+            .await
+            .unwrap();
+        let storage = ctx.task_storage();
+        storage.add_task(parent_task.clone()).await.unwrap();
+
+        // Create child task with skip_parent_repo_deferral
+        let child_task = TaskBuilder::new()
+            .repo_root(repo_path)
+            .name("review-task".to_string())
+            .prompt(Some("Review task".to_string()))
+            .parent_id(Some(parent_task.id.clone()))
+            .skip_parent_repo_deferral(true)
+            .build(&ctx)
+            .await
+            .unwrap();
+
+        assert_eq!(child_task.parent_ids, vec![parent_task.id]);
+        assert!(
+            child_task.copied_repo_path.is_some(),
+            "Child with skip_parent_repo_deferral should have copied_repo_path"
+        );
+        assert!(
+            child_task.source_branch.is_some(),
+            "Child with skip_parent_repo_deferral should have source_branch"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_task_builder_skip_parent_repo_deferral_inherits_parent_config() {
+        use crate::context::{ResolvedConfig, SharedConfig, TskConfig};
+        use crate::test_utils::TestGitRepository;
+        use std::collections::HashMap;
+
+        let test_repo = TestGitRepository::new().unwrap();
+        test_repo.init_with_commit().unwrap();
+        let repo_path = test_repo.path().to_path_buf();
+        let project_name = "test-project".to_string();
+
+        // Create parent with specific config (memory_gb = 32.0)
+        let mut project_configs = HashMap::new();
+        project_configs.insert(
+            project_name.clone(),
+            SharedConfig {
+                memory_gb: Some(32.0),
+                ..Default::default()
+            },
+        );
+        let tsk_config = TskConfig {
+            project: project_configs,
+            ..Default::default()
+        };
+        let ctx = AppContext::builder().with_tsk_config(tsk_config).build();
+
+        let parent_task = TaskBuilder::new()
+            .repo_root(repo_path.clone())
+            .name("parent-task".to_string())
+            .prompt(Some("Parent".to_string()))
+            .project(Some(project_name))
+            .build(&ctx)
+            .await
+            .unwrap();
+        let storage = ctx.task_storage();
+        storage.add_task(parent_task.clone()).await.unwrap();
+
+        // Create child with skip_parent_repo_deferral (no project override)
+        let child_task = TaskBuilder::new()
+            .repo_root(repo_path)
+            .name("review-task".to_string())
+            .prompt(Some("Review".to_string()))
+            .parent_id(Some(parent_task.id.clone()))
+            .skip_parent_repo_deferral(true)
+            .build(&ctx)
+            .await
+            .unwrap();
+
+        // Child should inherit parent's resolved_config
+        assert_eq!(
+            child_task.resolved_config, parent_task.resolved_config,
+            "Child should inherit parent's resolved_config"
+        );
+
+        let config: ResolvedConfig =
+            serde_json::from_str(child_task.resolved_config.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            config.memory_gb, 32.0,
+            "Inherited config should have parent's memory_gb"
         );
     }
 }
