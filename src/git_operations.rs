@@ -549,6 +549,104 @@ pub async fn get_current_branch(repo_path: &Path) -> Result<Option<String>, Stri
     .map_err(|e| format!("Task join error: {e}"))?
 }
 
+/// Get the git-town parent branch for a given branch
+pub async fn get_git_town_parent(
+    repo_path: &Path,
+    branch_name: &str,
+) -> Result<Option<String>, String> {
+    tokio::task::spawn_blocking({
+        let repo_path = repo_path.to_owned();
+        let branch_name = branch_name.to_owned();
+        move || -> Result<Option<String>, String> {
+            let repo = Repository::open(&repo_path)
+                .map_err(|e| format!("Failed to open repository: {e}"))?;
+            let config = repo
+                .config()
+                .map_err(|e| format!("Failed to get repository config: {e}"))?;
+            let key = format!("git-town-branch.{}.parent", branch_name);
+            match config.get_string(&key) {
+                Ok(parent) => Ok(Some(parent)),
+                Err(_) => Ok(None),
+            }
+        }
+    })
+    .await
+    .map_err(|e| format!("Task join error: {e}"))?
+}
+
+/// Check if `ancestor` is an ancestor of `descendant`
+pub async fn is_ancestor(
+    repo_path: &Path,
+    ancestor: &str,
+    descendant: &str,
+) -> Result<bool, String> {
+    tokio::task::spawn_blocking({
+        let repo_path = repo_path.to_owned();
+        let ancestor = ancestor.to_owned();
+        let descendant = descendant.to_owned();
+        move || -> Result<bool, String> {
+            let output = std::process::Command::new("git")
+                .current_dir(&repo_path)
+                .args(["merge-base", "--is-ancestor", &ancestor, &descendant])
+                .output()
+                .map_err(|e| format!("Failed to execute git merge-base --is-ancestor: {e}"))?;
+            Ok(output.status.success())
+        }
+    })
+    .await
+    .map_err(|e| format!("Task join error: {e}"))?
+}
+
+/// Compute the merge-base of two refs
+pub async fn merge_base(repo_path: &Path, ref1: &str, ref2: &str) -> Result<String, String> {
+    tokio::task::spawn_blocking({
+        let repo_path = repo_path.to_owned();
+        let ref1 = ref1.to_owned();
+        let ref2 = ref2.to_owned();
+        move || -> Result<String, String> {
+            let output = std::process::Command::new("git")
+                .current_dir(&repo_path)
+                .args(["merge-base", &ref1, &ref2])
+                .output()
+                .map_err(|e| format!("Failed to execute git merge-base: {e}"))?;
+            if !output.status.success() {
+                return Err(format!(
+                    "Failed to compute merge-base: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                ));
+            }
+            Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+        }
+    })
+    .await
+    .map_err(|e| format!("Task join error: {e}"))?
+}
+
+/// Resolve a git ref to a commit SHA
+pub async fn rev_parse(repo_path: &Path, ref_str: &str) -> Result<String, String> {
+    tokio::task::spawn_blocking({
+        let repo_path = repo_path.to_owned();
+        let ref_str = ref_str.to_owned();
+        move || -> Result<String, String> {
+            let output = std::process::Command::new("git")
+                .current_dir(&repo_path)
+                .args(["rev-parse", "--verify", &ref_str])
+                .output()
+                .map_err(|e| format!("Failed to execute git rev-parse: {e}"))?;
+            if !output.status.success() {
+                return Err(format!(
+                    "Failed to resolve ref '{}': {}",
+                    ref_str,
+                    String::from_utf8_lossy(&output.stderr)
+                ));
+            }
+            Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+        }
+    })
+    .await
+    .map_err(|e| format!("Task join error: {e}"))?
+}
+
 #[cfg(test)]
 mod integration_tests {
     use super::*;

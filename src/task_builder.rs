@@ -47,6 +47,9 @@ pub struct TaskBuilder {
     /// instead of deferring to the scheduler. Used for review tasks where the
     /// parent is already complete.
     skip_parent_repo_deferral: bool,
+    /// Override for the source commit SHA. When set, this value is used instead
+    /// of computing it from the repository HEAD.
+    source_commit_override: Option<String>,
 }
 
 impl TaskBuilder {
@@ -71,6 +74,7 @@ impl TaskBuilder {
             repo_copy_source: None,
             target_branch: None,
             skip_parent_repo_deferral: false,
+            source_commit_override: None,
         }
     }
 
@@ -201,10 +205,15 @@ impl TaskBuilder {
 
     /// When true, tasks with a parent_id copy the repo at creation time instead
     /// of deferring to the scheduler. The parent's resolved config is inherited.
-    /// Gated to `cfg(test)` until the review command is implemented.
-    #[cfg(test)]
     pub fn skip_parent_repo_deferral(mut self, skip: bool) -> Self {
         self.skip_parent_repo_deferral = skip;
+        self
+    }
+
+    /// Sets a custom source commit SHA instead of using the repository HEAD.
+    /// Used by review tasks to set the base commit for the diff.
+    pub fn source_commit_override(mut self, sha: Option<String>) -> Self {
+        self.source_commit_override = sha;
         self
     }
 
@@ -361,11 +370,17 @@ impl TaskBuilder {
                 .await?
         };
 
-        // Capture the current commit SHA
-        let source_commit = match git_operations::get_current_commit(&repo_root).await {
-            Ok(commit) => commit,
-            Err(e) => {
-                return Err(format!("Failed to get current commit for task '{name}': {e}").into());
+        // Capture the current commit SHA (or use override if provided)
+        let source_commit = if let Some(ref override_sha) = self.source_commit_override {
+            override_sha.clone()
+        } else {
+            match git_operations::get_current_commit(&repo_root).await {
+                Ok(commit) => commit,
+                Err(e) => {
+                    return Err(
+                        format!("Failed to get current commit for task '{name}': {e}").into(),
+                    );
+                }
             }
         };
 

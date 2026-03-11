@@ -9,6 +9,7 @@ pub mod delete;
 pub mod docker;
 pub mod list;
 pub mod retry;
+pub mod review;
 pub mod run;
 pub mod server;
 pub mod shell;
@@ -21,6 +22,7 @@ pub use clean::CleanCommand;
 pub use delete::DeleteCommand;
 pub use list::ListCommand;
 pub use retry::RetryCommand;
+pub use review::ReviewCommand;
 pub use run::RunCommand;
 pub use shell::ShellCommand;
 
