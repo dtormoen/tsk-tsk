@@ -428,11 +428,6 @@ impl DockerManager {
             env_vars.push("BUILDAH_ISOLATION=chroot".to_string());
         }
 
-        // Set PYTHONPATH for Python stacks so imports work from the project directory
-        if task.stack == "python" {
-            env_vars.push(format!("PYTHONPATH={working_dir}"));
-        }
-
         let agent_command = agent.build_command(
             instructions_file_path.to_str().unwrap_or("instructions.md"),
             task.is_interactive,
@@ -1656,7 +1651,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_python_stack_sets_pythonpath() {
+    async fn test_python_stack_does_not_set_pythonpath() {
         let mock_client = Arc::new(TrackedDockerClient::default());
         let ctx = AppContext::builder().build();
         let manager = DockerManager::new(&ctx, mock_client.clone(), None);
@@ -1670,29 +1665,16 @@ mod tests {
         let create_calls = mock_client.create_container_calls.lock().unwrap();
         let task_container_config = &create_calls[1].1;
         let env = task_container_config.env.as_ref().unwrap();
-        assert!(env.contains(&"PYTHONPATH=/workspace/my-python-app".to_string()));
 
-        // Also verify working_dir uses the project name
+        // PYTHONPATH should never be set automatically, even for the python stack,
+        // so projects that don't expect it keep their normal import behavior.
+        assert!(!env.iter().any(|e| e.starts_with("PYTHONPATH=")));
+
+        // working_dir still uses the project name
         assert_eq!(
             task_container_config.working_dir,
             Some("/workspace/my-python-app".to_string())
         );
-    }
-
-    #[tokio::test]
-    async fn test_non_python_stack_no_pythonpath() {
-        let mock_client = Arc::new(TrackedDockerClient::default());
-        let ctx = AppContext::builder().build();
-        let manager = DockerManager::new(&ctx, mock_client.clone(), None);
-
-        let task = create_test_task(false); // stack is "default"
-        let agent = crate::agent::ClaudeAgent::with_tsk_env(ctx.tsk_env());
-        let _ = manager.run_task_container("tsk/base", &task, &agent).await;
-
-        let create_calls = mock_client.create_container_calls.lock().unwrap();
-        let task_container_config = &create_calls[1].1;
-        let env = task_container_config.env.as_ref().unwrap();
-        assert!(!env.iter().any(|e| e.starts_with("PYTHONPATH=")));
     }
 
     #[tokio::test]
