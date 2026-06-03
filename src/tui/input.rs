@@ -157,14 +157,12 @@ pub fn handle_event(app: &mut TuiApp, event: &Event, data_dir: &Path) -> Option<
                         app.focus = Panel::Logs;
                     }
                 }
-                MouseEventKind::Drag(MouseButton::Left) => {
-                    if app.task_scrollbar_drag {
-                        let prev_selected = app.task_list_state.selected();
-                        let offset = scrollbar_row_to_offset(mouse.row, app);
-                        app.scroll_task_list_to_offset(offset);
-                        if app.task_list_state.selected() != prev_selected {
-                            app.load_logs_for_selected_task(data_dir);
-                        }
+                MouseEventKind::Drag(MouseButton::Left) if app.task_scrollbar_drag => {
+                    let prev_selected = app.task_list_state.selected();
+                    let offset = scrollbar_row_to_offset(mouse.row, app);
+                    app.scroll_task_list_to_offset(offset);
+                    if app.task_list_state.selected() != prev_selected {
+                        app.load_logs_for_selected_task(data_dir);
                     }
                 }
                 MouseEventKind::Up(MouseButton::Left) => {
