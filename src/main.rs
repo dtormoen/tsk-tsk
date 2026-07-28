@@ -125,6 +125,10 @@ enum Commands {
         #[arg(long)]
         sudo: bool,
 
+        /// Join the sandbox to your Tailscale tailnet (requires an auth key)
+        #[arg(long)]
+        tailscale: bool,
+
         /// Expose a host device to the container (can be repeated, e.g. --device /dev/video0)
         #[arg(long = "device")]
         devices: Vec<String>,
@@ -198,6 +202,10 @@ enum Commands {
         /// Enable passwordless sudo inside containers
         #[arg(long)]
         sudo: bool,
+
+        /// Join the sandbox to your Tailscale tailnet (requires an auth key)
+        #[arg(long)]
+        tailscale: bool,
 
         /// Expose a host device to the container (can be repeated, e.g. --device /dev/video0)
         #[arg(long = "device")]
@@ -274,6 +282,10 @@ enum Commands {
         #[arg(long)]
         sudo: bool,
 
+        /// Join the sandbox to your Tailscale tailnet (requires an auth key)
+        #[arg(long)]
+        tailscale: bool,
+
         /// Expose a host device to the container (can be repeated, e.g. --device /dev/video0)
         #[arg(long = "device")]
         devices: Vec<String>,
@@ -348,6 +360,10 @@ enum Commands {
         /// Enable passwordless sudo inside containers
         #[arg(long)]
         sudo: bool,
+
+        /// Join the sandbox to your Tailscale tailnet (requires an auth key)
+        #[arg(long)]
+        tailscale: bool,
 
         /// Expose a host device to the container (can be repeated, e.g. --device /dev/video0)
         #[arg(long = "device")]
@@ -514,6 +530,7 @@ async fn main() {
             dind,
             privileged,
             sudo,
+            tailscale,
             devices,
             wait,
             branch,
@@ -537,6 +554,7 @@ async fn main() {
                     dind,
                     privileged,
                     sudo,
+                    tailscale,
                     devices,
                     branch,
                 },
@@ -560,6 +578,7 @@ async fn main() {
             dind,
             privileged,
             sudo,
+            tailscale,
             devices,
             branch,
         } => {
@@ -582,6 +601,7 @@ async fn main() {
                     dind,
                     privileged,
                     sudo,
+                    tailscale,
                     devices,
                     branch,
                 },
@@ -604,6 +624,7 @@ async fn main() {
             dind,
             privileged,
             sudo,
+            tailscale,
             devices,
             branch,
         } => {
@@ -626,6 +647,7 @@ async fn main() {
                     dind,
                     privileged,
                     sudo,
+                    tailscale,
                     devices,
                     branch,
                 },
@@ -654,6 +676,7 @@ async fn main() {
             dind,
             privileged,
             sudo,
+            tailscale,
             devices,
             no_children,
             from_cwd,
@@ -668,6 +691,7 @@ async fn main() {
             dind: if dind { Some(true) } else { None },
             privileged: if privileged { Some(true) } else { None },
             sudo: if sudo { Some(true) } else { None },
+            tailscale: if tailscale { Some(true) } else { None },
             devices,
             no_children,
             from_cwd,

@@ -35,7 +35,7 @@ The foundation of all `tsk` containers (`base/default.dockerfile`):
 - Git configuration inherited from host user via build arguments
 - Build-time working directory set to `/workspace` (at runtime, `/workspace/{project_name}`)
 - Contains placeholders (`{{{STACK}}}`, `{{{PROJECT}}}`, `{{{AGENT}}}`) for layer composition
-- Config-driven flags (e.g., `sudo = true`) may inject additional Dockerfile content between layers at build time
+- Config-driven flags (e.g., `sudo = true`, `tailscale = true`) may inject additional Dockerfile content between layers at build time. Tailscale injects `features/tailscale.dockerfile`, which installs `tailscale`/`tailscaled` and the startup script that joins the tailnet.
 
 ### 2. Stack Layer
 Language-specific toolchains and runtimes:

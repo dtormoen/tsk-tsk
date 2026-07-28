@@ -22,6 +22,7 @@ pub struct RetryOverrides {
     pub dind: Option<bool>,
     pub privileged: Option<bool>,
     pub sudo: Option<bool>,
+    pub tailscale: Option<bool>,
     pub devices: Vec<String>,
     pub repo_copy_source: Option<PathBuf>,
 }
@@ -234,6 +235,9 @@ impl TaskManager {
         }
         if let Some(sudo) = overrides.sudo {
             builder = builder.sudo(Some(sudo));
+        }
+        if let Some(tailscale) = overrides.tailscale {
+            builder = builder.tailscale(Some(tailscale));
         }
         if !overrides.devices.is_empty() {
             builder = builder.devices(overrides.devices);

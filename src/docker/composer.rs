@@ -119,7 +119,30 @@ impl DockerComposer {
         };
         vars.insert("SUDO".to_string(), sudo_content);
 
+        let tailscale_content = match resolved_config {
+            Some(config) if config.tailscale => Self::tailscale_layer(),
+            _ => String::new(),
+        };
+        vars.insert("TAILSCALE".to_string(), tailscale_content);
+
         vars
+    }
+
+    /// Dockerfile content that installs Tailscale and its startup script.
+    ///
+    /// The snippet is compiled into the binary, so the error arm is a
+    /// can't-happen guard. If it ever fired, the image would build **without**
+    /// the startup script and the task would then fail at container start
+    /// (`tsk-tailscale-up: not found`) — i.e. the failure moves from build time
+    /// to run time; it does not silently run the agent without the tailnet.
+    fn tailscale_layer() -> String {
+        match crate::assets::embedded::get_dockerfile("features/tailscale").map(String::from_utf8) {
+            Ok(Ok(content)) => content,
+            _ => {
+                eprintln!("Warning: Failed to load the embedded Tailscale Docker layer");
+                String::new()
+            }
+        }
     }
 
     /// Extract build arguments from Dockerfile content
@@ -358,6 +381,39 @@ RUN echo "Hello"
             composed.dockerfile_content.contains("NOPASSWD:ALL"),
             "Sudo injection should add NOPASSWD sudoers rule"
         );
+    }
+
+    #[test]
+    fn test_compose_with_tailscale_injects_layer() {
+        let composer = create_test_composer();
+        let config = crate::docker::layers::DockerImageConfig::new(
+            "default".to_string(),
+            "claude".to_string(),
+            "default".to_string(),
+        );
+
+        let resolved = ResolvedConfig {
+            tailscale: true,
+            ..Default::default()
+        };
+
+        let composed = composer.compose(&config, None, Some(&resolved)).unwrap();
+        assert!(
+            composed.dockerfile_content.contains("tailscaled"),
+            "Tailscale layer should install tailscaled"
+        );
+        assert!(
+            composed
+                .dockerfile_content
+                .contains("/usr/local/bin/tsk-tailscale-up"),
+            "Tailscale layer should install the startup script"
+        );
+
+        // Disabled by default: no Tailscale content in the Dockerfile
+        let composed = composer
+            .compose(&config, None, Some(&ResolvedConfig::default()))
+            .unwrap();
+        assert!(!composed.dockerfile_content.contains("tailscale"));
     }
 
     #[test]

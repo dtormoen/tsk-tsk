@@ -99,6 +99,195 @@ fn cgroup_controller_available(controller: &str) -> bool {
     true
 }
 
+/// Path to the Tailscale startup script installed by the tailscale Docker layer.
+const TAILSCALE_STARTUP_SCRIPT: &str = "/usr/local/bin/tsk-tailscale-up";
+/// TUN device `tailscaled` uses for kernel networking mode.
+const TUN_DEVICE_PATH: &str = "/dev/net/tun";
+/// Destinations that must bypass the Squid proxy when Tailscale is enabled:
+/// the tailnet CGNAT range (IPv4), the tailnet ULA range (IPv6), and MagicDNS
+/// names.
+const TAILSCALE_NO_PROXY: &str = "100.64.0.0/10,fd7a:115c:a1e0::/48,.ts.net";
+/// SOCKS5 endpoint `tailscaled` exposes in userspace mode (no TUN device), used
+/// as `ALL_PROXY` so the tailnet is reachable when kernel routing isn't. Uses
+/// `socks5h://` so `tailscaled` resolves tailnet peer names from its netmap
+/// (MagicDNS-off notwithstanding); `/etc/hosts` aliases cover the kernel-mode
+/// path where no proxy is in play.
+const TAILSCALE_USERSPACE_SOCKS5: &str = "socks5h://localhost:1055";
+
+/// Resolves the Tailscale auth key for a task from the configured sources.
+///
+/// The key is looked up in the environment variable named by
+/// `tailscale_auth_key_env` (default `TS_AUTHKEY`), falling back to the contents
+/// of `tailscale_auth_key_file`. Keys are read at container start so they are
+/// never written to the task's config snapshot.
+pub(crate) fn resolve_tailscale_auth_key(
+    resolved: &crate::context::ResolvedConfig,
+) -> Result<String, String> {
+    resolve_tailscale_auth_key_with(resolved, |name| std::env::var(name).ok())
+}
+
+/// [`resolve_tailscale_auth_key`] with an injectable environment lookup.
+fn resolve_tailscale_auth_key_with(
+    resolved: &crate::context::ResolvedConfig,
+    env_lookup: impl Fn(&str) -> Option<String>,
+) -> Result<String, String> {
+    let env_var = resolved.tailscale_auth_key_env_var();
+
+    if let Some(key) = env_lookup(env_var) {
+        let key = key.trim().to_string();
+        if !key.is_empty() {
+            return Ok(key);
+        }
+    }
+
+    if let Some(ref path) = resolved.tailscale_auth_key_file {
+        let path = crate::context::tsk_config::expand_tilde(path);
+        let contents = std::fs::read_to_string(&path).map_err(|e| {
+            format!(
+                "Failed to read tailscale_auth_key_file '{}': {e}",
+                path.display()
+            )
+        })?;
+        let key = contents.trim().to_string();
+        if key.is_empty() {
+            return Err(format!(
+                "tailscale_auth_key_file '{}' is empty",
+                path.display()
+            ));
+        }
+        return Ok(key);
+    }
+
+    Err(format!(
+        "Tailscale is enabled but no auth key was found. Set ${env_var} or set \
+         tailscale_auth_key_file in tsk.toml."
+    ))
+}
+
+/// Collects tailnet device name→IP aliases from the host's `tailscale status`,
+/// as Docker `ExtraHosts` entries (`name:ip`) written into the container's
+/// `/etc/hosts` at creation. This lets a non-root agent reach tailnet devices
+/// by name without any in-container privilege. Returns empty if the `tailscale`
+/// CLI is missing or errors (non-fatal — names just won't resolve). Skipped
+/// under `cfg(test)` so unit tests stay hermetic.
+fn tailnet_host_aliases() -> Vec<String> {
+    if cfg!(test) {
+        return Vec::new();
+    }
+    let output = match std::process::Command::new("tailscale")
+        .args(["status", "--json"])
+        .output()
+    {
+        Ok(o) if o.status.success() => o.stdout,
+        _ => return Vec::new(),
+    };
+    match serde_json::from_slice::<serde_json::Value>(&output) {
+        Ok(json) => parse_tailnet_aliases(&json),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Parses `tailscale status --json` into `name:ip` ExtraHosts entries, emitting
+/// both the FQDN and the short host label for each node (Self + Peers).
+fn parse_tailnet_aliases(json: &serde_json::Value) -> Vec<String> {
+    fn push_node(aliases: &mut Vec<String>, node: &serde_json::Value) {
+        let ip = node
+            .get("TailscaleIPs")
+            .and_then(|v| v.as_array())
+            .and_then(|a| a.first())
+            .and_then(|v| v.as_str());
+        let dns = node.get("DNSName").and_then(|v| v.as_str());
+        if let (Some(ip), Some(dns)) = (ip, dns) {
+            let fqdn = dns.trim_end_matches('.');
+            // Defensive: names come from peer-controlled data, so skip anything
+            // that isn't a clean DNS name with a parseable IP — a stray `:` or
+            // space would otherwise produce a malformed `name:ip` ExtraHosts line
+            // that Docker rejects, failing container creation.
+            if fqdn.is_empty()
+                || ip.parse::<std::net::IpAddr>().is_err()
+                || !fqdn
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
+            {
+                return;
+            }
+            aliases.push(format!("{fqdn}:{ip}"));
+            let short = fqdn.split('.').next().unwrap_or(fqdn);
+            if short != fqdn && !short.is_empty() {
+                aliases.push(format!("{short}:{ip}"));
+            }
+        }
+    }
+
+    let mut aliases = Vec::new();
+    if let Some(self_node) = json.get("Self") {
+        push_node(&mut aliases, self_node);
+    }
+    if let Some(peers) = json.get("Peer").and_then(|v| v.as_object()) {
+        for peer in peers.values() {
+            push_node(&mut aliases, peer);
+        }
+    }
+    aliases
+}
+
+/// Assembles the container's `ExtraHosts`: the proxy container mapping (when
+/// network isolation is on) followed by any tailnet device aliases. Returns
+/// `None` when there are no entries so the runtime keeps its default `/etc/hosts`.
+fn build_extra_hosts(proxy_entry: Option<String>, tailnet_aliases: Vec<String>) -> Option<Vec<String>> {
+    let mut hosts = Vec::new();
+    if let Some(entry) = proxy_entry {
+        hosts.push(entry);
+    }
+    hosts.extend(tailnet_aliases);
+    if hosts.is_empty() {
+        None
+    } else {
+        Some(hosts)
+    }
+}
+
+/// Prefixes a container command with the Tailscale startup script.
+///
+/// The sandbox joins the tailnet before the agent starts; if the script fails
+/// the container exits rather than running the agent without tailnet access.
+/// After the join, `TS_AUTHKEY` is `unset` and the agent command is **`exec`'d**,
+/// which replaces the process image *after* the unset so the key is cleared from
+/// the kernel-visible `/proc/<pid>/environ`, not just glibc's in-memory `environ`.
+/// (A plain `unset` without the exec would leave the key readable in a lingering
+/// PID-1 shell whenever the agent command is a pipeline, which it normally is.)
+/// The key still lives in the container's `Config.Env` — visible to anyone who
+/// can `docker inspect` the container on the host — for the container's lifetime;
+/// what this prevents is the *in-container agent* recovering it.
+/// An empty command (image default) is returned unchanged.
+fn with_tailscale_startup(command: Vec<String>) -> Vec<String> {
+    if command.is_empty() {
+        return command;
+    }
+
+    let prefix =
+        format!("{TAILSCALE_STARTUP_SCRIPT} || exit 1\nunset TS_AUTHKEY TSK_TAILSCALE_UP_ARGS");
+
+    // Always `exec` the (quoted) agent command — including the `sh -c <script>`
+    // case, which becomes `exec sh -c <script>`. The exec is what guarantees the
+    // surviving process's environment is the post-`unset` one.
+    let quoted = command
+        .iter()
+        .map(|arg| shell_quote(arg))
+        .collect::<Vec<_>>()
+        .join(" ");
+    vec![
+        "sh".to_string(),
+        "-c".to_string(),
+        format!("{prefix}\nexec {quoted}"),
+    ]
+}
+
+/// Wraps an argument in single quotes for safe use inside a `sh -c` script.
+fn shell_quote(arg: &str) -> String {
+    format!("'{}'", arg.replace('\'', r"'\''"))
+}
+
 /// Standard proxy environment variable names forwarded to/from containers.
 /// Additional variables like JAVA_TOOL_OPTIONS and TSK_PROXY_HOST are handled separately.
 pub(crate) const PROXY_ENV_VARS: &[&str] = &[
@@ -144,6 +333,21 @@ pub(crate) fn resolve_config_from_task(
         project_config.as_ref(),
         Some(&task.repo_root),
     )
+}
+
+/// Networking inputs for a task container.
+///
+/// Groups the proxy wiring with the optional Tailscale auth key so they travel
+/// together from proxy acquisition down to container creation.
+struct ContainerNetworking<'a> {
+    /// Docker network the container joins, when network isolation is enabled
+    network_name: Option<&'a str>,
+    /// Proxy configuration used for proxy env vars and `extra_hosts`
+    proxy_config: Option<&'a crate::context::ResolvedProxyConfig>,
+    /// Proxy container IP on the agent network, used for `extra_hosts`
+    proxy_ip: Option<&'a str>,
+    /// Auth key used to join the tailnet, when Tailscale is enabled
+    tailscale_auth_key: Option<&'a str>,
 }
 
 /// Manages Docker container execution for TSK tasks.
@@ -248,14 +452,39 @@ impl DockerManager {
 
         let proxy_url = proxy_config.proxy_url();
         let proxy_container_name = proxy_config.proxy_container_name();
+
+        // Tailscale reachability differs by mode. Docker gets a real TUN device
+        // (kernel mode): tailnet IPs are transparently routed, so they bypass the
+        // proxy via NO_PROXY. Rootless Podman can't use a TUN, so `tailscaled`
+        // runs in userspace mode where the tailnet is reachable ONLY through its
+        // SOCKS5 proxy — putting the tailnet in NO_PROXY there forces a routeless
+        // direct connection and breaks it. So the bypass is kernel-mode-only, and
+        // userspace mode instead points ALL_PROXY at the SOCKS5 listener.
+        let tailscale_kernel_mode = resolved.tailscale
+            && self.ctx.tsk_config().container_engine == ContainerEngine::Docker;
+        let tailscale_userspace_mode = resolved.tailscale && !tailscale_kernel_mode;
+
+        let no_proxy_hosts = if tailscale_kernel_mode {
+            format!("localhost,127.0.0.1,{proxy_container_name},{TAILSCALE_NO_PROXY}")
+        } else {
+            format!("localhost,127.0.0.1,{proxy_container_name}")
+        };
         let mut env = vec![
             format!("HTTP_PROXY={proxy_url}"),
             format!("HTTPS_PROXY={proxy_url}"),
             format!("http_proxy={proxy_url}"),
             format!("https_proxy={proxy_url}"),
-            format!("NO_PROXY=localhost,127.0.0.1,{proxy_container_name}"),
-            format!("no_proxy=localhost,127.0.0.1,{proxy_container_name}"),
+            format!("NO_PROXY={no_proxy_hosts}"),
+            format!("no_proxy={no_proxy_hosts}"),
         ];
+
+        // Userspace mode: reach the tailnet through tailscaled's SOCKS5 proxy.
+        // HTTP(S) still go to Squid (HTTP_PROXY takes precedence over ALL_PROXY),
+        // so only tailnet/other-scheme traffic rides the SOCKS5 listener.
+        if tailscale_userspace_mode {
+            env.push(format!("ALL_PROXY={TAILSCALE_USERSPACE_SOCKS5}"));
+            env.push(format!("all_proxy={TAILSCALE_USERSPACE_SOCKS5}"));
+        }
 
         // JVM proxy system properties via JAVA_TOOL_OPTIONS
         // Maven and Gradle ignore HTTP_PROXY env vars, so this ensures all JVM
@@ -379,17 +608,20 @@ impl DockerManager {
     /// * `image` - The Docker image to use
     /// * `task` - The task containing all necessary configuration
     /// * `agent` - The agent to get volumes and environment variables from
-    /// * `network_name` - The Docker network name for the container to join
-    /// * `proxy_config` - The proxy configuration for env var setup
+    /// * `networking` - Proxy wiring and Tailscale auth key for the container
     fn create_container_config(
         &self,
         image: &str,
         task: &crate::task::Task,
         agent: &dyn Agent,
-        network_name: Option<&str>,
-        proxy_config: Option<&crate::context::ResolvedProxyConfig>,
-        proxy_container_ip: Option<&str>,
+        networking: &ContainerNetworking<'_>,
     ) -> (ContainerCreateBody, DindStorage) {
+        let ContainerNetworking {
+            network_name,
+            proxy_config,
+            proxy_ip: proxy_container_ip,
+            tailscale_auth_key,
+        } = *networking;
         let resolved = resolve_config_from_task(task, &self.ctx, &self.event_sender);
         let mut binds = self.build_bind_volumes(task, agent, &resolved);
         let instructions_file_path = PathBuf::from(&task.instructions_file);
@@ -428,6 +660,31 @@ impl DockerManager {
             env_vars.push("BUILDAH_ISOLATION=chroot".to_string());
         }
 
+        // Tailscale: pass the auth key and node settings to the startup script.
+        // The key comes from the host environment or a key file, never from the
+        // task's stored config snapshot.
+        let tailscale_enabled = resolved.tailscale && tailscale_auth_key.is_some();
+        if let Some(auth_key) = tailscale_auth_key.filter(|_| resolved.tailscale) {
+            env_vars.push(format!("TS_AUTHKEY={auth_key}"));
+            env_vars.push(format!(
+                "TSK_TAILSCALE_HOSTNAME={}",
+                resolved.tailscale_hostname_for(&task.id)
+            ));
+            // Sets the *initial* accept-routes posture (default off, so the join
+            // reaches tailnet nodes but not advertised subnet routes, which would
+            // bypass the Squid allowlist). This is defense-in-depth, not an
+            // enforced boundary: the agent owns the tailscaled socket and can
+            // re-enable routes at runtime — the real boundary is your ACLs. Opt
+            // in with `tailscale_accept_routes = true`.
+            env_vars.push(format!(
+                "TSK_TAILSCALE_ACCEPT_ROUTES={}",
+                resolved.tailscale_accept_routes
+            ));
+            if let Some(ref up_args) = resolved.tailscale_up_args {
+                env_vars.push(format!("TSK_TAILSCALE_UP_ARGS={up_args}"));
+            }
+        }
+
         let agent_command = agent.build_command(
             instructions_file_path.to_str().unwrap_or("instructions.md"),
             task.is_interactive,
@@ -435,6 +692,8 @@ impl DockerManager {
 
         let command = if agent_command.is_empty() {
             None
+        } else if tailscale_enabled {
+            Some(with_tailscale_startup(agent_command))
         } else {
             Some(agent_command)
         };
@@ -442,35 +701,51 @@ impl DockerManager {
         let container_engine = &self.ctx.tsk_config().container_engine;
 
         // Build device mappings from resolved config, expanding glob patterns
-        let devices: Option<Vec<DeviceMapping>> = if resolved.devices.is_empty() {
+        let mut device_mappings: Vec<DeviceMapping> = Vec::new();
+        for pattern in &resolved.devices {
+            if pattern.contains('*') || pattern.contains('?') || pattern.contains('[') {
+                if let Ok(paths) = glob::glob(pattern) {
+                    for entry in paths.flatten() {
+                        let path_str = entry.to_string_lossy().to_string();
+                        device_mappings.push(DeviceMapping {
+                            path_on_host: Some(path_str.clone()),
+                            path_in_container: Some(path_str),
+                            cgroup_permissions: Some("rwm".to_string()),
+                        });
+                    }
+                }
+            } else {
+                device_mappings.push(DeviceMapping {
+                    path_on_host: Some(pattern.clone()),
+                    path_in_container: Some(pattern.clone()),
+                    cgroup_permissions: Some("rwm".to_string()),
+                });
+            }
+        }
+
+        // Map a TUN device for transparent kernel-mode networking, using the
+        // SAME condition that drives the proxy-env mode decision (Docker + a
+        // host TUN) so the two never disagree. Rootless Podman can't hand a
+        // usable TUN to the container even when the host has one, so it is
+        // excluded here and (correctly) runs userspace mode with `ALL_PROXY`.
+        if tailscale_enabled
+            && *container_engine == ContainerEngine::Docker
+            && std::path::Path::new(TUN_DEVICE_PATH).exists()
+            && !device_mappings
+                .iter()
+                .any(|d| d.path_in_container.as_deref() == Some(TUN_DEVICE_PATH))
+        {
+            device_mappings.push(DeviceMapping {
+                path_on_host: Some(TUN_DEVICE_PATH.to_string()),
+                path_in_container: Some(TUN_DEVICE_PATH.to_string()),
+                cgroup_permissions: Some("rwm".to_string()),
+            });
+        }
+
+        let devices = if device_mappings.is_empty() {
             None
         } else {
-            let mut mappings = Vec::new();
-            for pattern in &resolved.devices {
-                if pattern.contains('*') || pattern.contains('?') || pattern.contains('[') {
-                    if let Ok(paths) = glob::glob(pattern) {
-                        for entry in paths.flatten() {
-                            let path_str = entry.to_string_lossy().to_string();
-                            mappings.push(DeviceMapping {
-                                path_on_host: Some(path_str.clone()),
-                                path_in_container: Some(path_str),
-                                cgroup_permissions: Some("rwm".to_string()),
-                            });
-                        }
-                    }
-                } else {
-                    mappings.push(DeviceMapping {
-                        path_on_host: Some(pattern.clone()),
-                        path_in_container: Some(pattern.clone()),
-                        cgroup_permissions: Some("rwm".to_string()),
-                    });
-                }
-            }
-            if mappings.is_empty() {
-                None
-            } else {
-                Some(mappings)
-            }
+            Some(device_mappings)
         };
 
         // Security relaxations: seccomp/AppArmor for DIND, SETUID/SETGID for DIND or sudo
@@ -499,14 +774,21 @@ impl DockerManager {
             None
         };
 
+        // Tailscale's tailscaled needs NET_ADMIN to configure the TUN interface
+        // and tailnet routes, so it is granted instead of dropped when enabled.
         let mut cap_drop = vec![
-            "NET_ADMIN".to_string(),
             "SETPCAP".to_string(),
             "SYS_ADMIN".to_string(),
             "SYS_PTRACE".to_string(),
             "DAC_OVERRIDE".to_string(),
             "AUDIT_WRITE".to_string(),
         ];
+        let cap_add = if tailscale_enabled {
+            Some(vec!["NET_ADMIN".to_string()])
+        } else {
+            cap_drop.insert(0, "NET_ADMIN".to_string());
+            None
+        };
         if !task.dind && !resolved.sudo {
             cap_drop.push("SETUID".to_string());
             cap_drop.push("SETGID".to_string());
@@ -573,6 +855,7 @@ impl DockerManager {
                     None
                 },
                 devices,
+                cap_add,
                 cap_drop: Some(cap_drop),
                 security_opt,
                 tmpfs: if matches!(dind_storage, DindStorage::Tmpfs) {
@@ -590,12 +873,19 @@ impl DockerManager {
                 } else {
                     None
                 },
-                extra_hosts: match (proxy_config, proxy_container_ip) {
-                    (Some(pc), Some(ip)) => {
-                        Some(vec![format!("{}:{}", pc.proxy_container_name(), ip)])
-                    }
-                    _ => None,
-                },
+                extra_hosts: build_extra_hosts(
+                    match (proxy_config, proxy_container_ip) {
+                        (Some(pc), Some(ip)) => Some(format!("{}:{}", pc.proxy_container_name(), ip)),
+                        _ => None,
+                    },
+                    // Tailnet device name→IP aliases (snapshotted from the host's
+                    // view) so the agent can reach tailnet hosts by name.
+                    if tailscale_enabled && resolved.tailscale_host_aliases {
+                        tailnet_host_aliases()
+                    } else {
+                        Vec::new()
+                    },
+                ),
                 ..Default::default()
             }),
             working_dir: Some(working_dir),
@@ -639,6 +929,14 @@ impl DockerManager {
         let resolved = resolve_config_from_task(task, &self.ctx, &self.event_sender);
         let proxy_config = resolved.proxy_config();
 
+        // Resolve the Tailscale auth key before any container work so a missing
+        // key fails fast with an actionable message.
+        let tailscale_auth_key = if resolved.tailscale {
+            Some(resolve_tailscale_auth_key(&resolved)?)
+        } else {
+            None
+        };
+
         let proxy_session = if task.network_isolation && !self.is_nested() {
             let suppress_stdout = self.event_sender.is_some();
             let proxy_logger = TaskLogger::from_path(
@@ -674,9 +972,12 @@ impl DockerManager {
                 docker_image_tag,
                 task,
                 agent,
-                proxy_session.as_ref().map(|s| s.network_name.as_str()),
-                proxy_session.as_ref().map(|_| &proxy_config),
-                proxy_session.as_ref().and_then(|s| s.proxy_ip.as_deref()),
+                &ContainerNetworking {
+                    network_name: proxy_session.as_ref().map(|s| s.network_name.as_str()),
+                    proxy_config: proxy_session.as_ref().map(|_| &proxy_config),
+                    proxy_ip: proxy_session.as_ref().and_then(|s| s.proxy_ip.as_deref()),
+                    tailscale_auth_key: tailscale_auth_key.as_deref(),
+                },
             )
             .await;
 
@@ -704,23 +1005,15 @@ impl DockerManager {
         docker_image_tag: &str,
         task: &crate::task::Task,
         agent: &dyn Agent,
-        network_name: Option<&str>,
-        proxy_config: Option<&crate::context::ResolvedProxyConfig>,
-        proxy_container_ip: Option<&str>,
+        networking: &ContainerNetworking<'_>,
     ) -> (
         Option<String>,
         DindStorage,
         Result<(String, crate::agent::TaskResult), String>,
     ) {
         let suppress_stdout = self.event_sender.is_some();
-        let (config, dind_storage) = self.create_container_config(
-            docker_image_tag,
-            task,
-            agent,
-            network_name,
-            proxy_config,
-            proxy_container_ip,
-        );
+        let (config, dind_storage) =
+            self.create_container_config(docker_image_tag, task, agent, networking);
         let container_name = self.build_container_name(task);
         let options = bollard::query_parameters::CreateContainerOptionsBuilder::default()
             .name(&container_name)
@@ -1970,6 +2263,459 @@ mod tests {
         assert!(
             host_config.security_opt.is_none(),
             "security_opt should be None when only sudo is enabled (not dind)"
+        );
+    }
+    /// Builds a task whose config snapshot enables Tailscale with the auth key
+    /// read from `key_file`. The env var name is one that is never set so the
+    /// test does not depend on the ambient environment.
+    fn tailscale_task(key_file: &std::path::Path, hostname: Option<&str>) -> Task {
+        let resolved = crate::context::ResolvedConfig {
+            tailscale: true,
+            tailscale_auth_key_env: Some("TSK_TEST_UNSET_TS_AUTHKEY".to_string()),
+            tailscale_auth_key_file: Some(key_file.to_string_lossy().to_string()),
+            tailscale_hostname: hostname.map(|h| h.to_string()),
+            tailscale_up_args: Some("--ssh".to_string()),
+            ..Default::default()
+        };
+        let mut task = create_test_task(false);
+        task.resolved_config = Some(serde_json::to_string(&resolved).unwrap());
+        task
+    }
+
+    #[tokio::test]
+    async fn test_tailscale_container_configuration() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let key_file = temp_dir.path().join("ts-authkey");
+        std::fs::write(&key_file, "tskey-auth-test\n").unwrap();
+
+        let mock_client = Arc::new(TrackedDockerClient::default());
+        let ctx = AppContext::builder().build();
+        let manager = DockerManager::new(&ctx, mock_client.clone(), None);
+
+        let task = tailscale_task(&key_file, None);
+        let agent = crate::agent::ClaudeAgent::with_tsk_env(ctx.tsk_env());
+        let result = manager.run_task_container("tsk/base", &task, &agent).await;
+        assert!(result.is_ok());
+
+        let create_calls = mock_client.create_container_calls.lock().unwrap();
+        let task_config = &create_calls[1].1;
+        let env = task_config.env.as_ref().unwrap();
+
+        // The auth key is read from the key file and trimmed
+        assert!(env.contains(&"TS_AUTHKEY=tskey-auth-test".to_string()));
+        // Hostname defaults to tsk-<task-id>
+        assert!(env.contains(&"TSK_TAILSCALE_HOSTNAME=tsk-test-task-id".to_string()));
+        assert!(env.contains(&"TSK_TAILSCALE_UP_ARGS=--ssh".to_string()));
+        // Subnet routes are off unless explicitly opted in
+        assert!(env.contains(&"TSK_TAILSCALE_ACCEPT_ROUTES=false".to_string()));
+
+        // Tailnet destinations bypass the Squid proxy
+        let no_proxy = env
+            .iter()
+            .find(|e| e.starts_with("NO_PROXY="))
+            .expect("NO_PROXY should be set");
+        assert!(no_proxy.contains("100.64.0.0/10"), "got: {no_proxy}");
+        assert!(no_proxy.contains("fd7a:115c:a1e0::/48"), "got: {no_proxy}");
+        assert!(no_proxy.contains(".ts.net"), "got: {no_proxy}");
+        // Kernel mode (Docker) routes the tailnet transparently, so no ALL_PROXY.
+        assert!(
+            !env.iter().any(|e| e.starts_with("ALL_PROXY=")),
+            "kernel mode must not set ALL_PROXY"
+        );
+
+        // tailscaled needs NET_ADMIN, so it is granted rather than dropped
+        let host_config = task_config.host_config.as_ref().unwrap();
+        let cap_drop = host_config.cap_drop.as_ref().unwrap();
+        assert!(!cap_drop.contains(&"NET_ADMIN".to_string()));
+        assert_eq!(
+            host_config.cap_add,
+            Some(vec!["NET_ADMIN".to_string()]),
+            "NET_ADMIN should be added when Tailscale is enabled"
+        );
+
+        // The startup script runs before the agent command
+        let cmd = task_config.cmd.as_ref().unwrap();
+        assert_eq!(cmd[0], "sh");
+        assert_eq!(cmd[1], "-c");
+        assert!(
+            cmd[2].starts_with("/usr/local/bin/tsk-tailscale-up || exit 1\n"),
+            "got: {}",
+            cmd[2]
+        );
+        // The auth key is scrubbed from the env before the agent runs
+        assert!(
+            cmd[2].contains("unset TS_AUTHKEY"),
+            "auth key must be unset before the agent command, got: {}",
+            cmd[2]
+        );
+        assert!(
+            cmd[2].contains("claude"),
+            "agent command should be preserved"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tailscale_hostname_and_accept_routes_overrides() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let key_file = temp_dir.path().join("ts-authkey");
+        std::fs::write(&key_file, "tskey-auth-test\n").unwrap();
+
+        let mock_client = Arc::new(TrackedDockerClient::default());
+        let ctx = AppContext::builder().build();
+        let manager = DockerManager::new(&ctx, mock_client.clone(), None);
+
+        // Custom hostname + accept_routes explicitly enabled
+        let resolved = crate::context::ResolvedConfig {
+            tailscale: true,
+            tailscale_auth_key_env: Some("TSK_TEST_UNSET_TS_AUTHKEY".to_string()),
+            tailscale_auth_key_file: Some(key_file.to_string_lossy().to_string()),
+            tailscale_hostname: Some("sandbox".to_string()),
+            tailscale_accept_routes: true,
+            ..Default::default()
+        };
+        let mut task = create_test_task(false);
+        task.resolved_config = Some(serde_json::to_string(&resolved).unwrap());
+
+        let agent = crate::agent::ClaudeAgent::with_tsk_env(ctx.tsk_env());
+        manager
+            .run_task_container("tsk/base", &task, &agent)
+            .await
+            .unwrap();
+
+        let create_calls = mock_client.create_container_calls.lock().unwrap();
+        let env = create_calls[1].1.env.as_ref().unwrap();
+        assert!(
+            env.contains(&"TSK_TAILSCALE_HOSTNAME=sandbox".to_string()),
+            "custom hostname should reach the container env"
+        );
+        assert!(
+            env.contains(&"TSK_TAILSCALE_ACCEPT_ROUTES=true".to_string()),
+            "accept_routes=true should reach the container env"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tailscale_userspace_mode_proxy_env() {
+        use crate::context::tsk_config::{ContainerEngine, TskConfig};
+
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let key_file = temp_dir.path().join("ts-authkey");
+        std::fs::write(&key_file, "tskey-auth-test\n").unwrap();
+
+        // Podman → userspace mode: the tailnet must NOT be in NO_PROXY (no route),
+        // and ALL_PROXY must point at the SOCKS5 listener instead.
+        let tsk_config = TskConfig {
+            container_engine: ContainerEngine::Podman,
+            ..Default::default()
+        };
+        let ctx = AppContext::builder().with_tsk_config(tsk_config).build();
+        let mock_client = Arc::new(TrackedDockerClient::default());
+        let manager = DockerManager::new(&ctx, mock_client.clone(), None);
+
+        let task = tailscale_task(&key_file, None);
+        let agent = crate::agent::ClaudeAgent::with_tsk_env(ctx.tsk_env());
+        manager
+            .run_task_container("tsk/base", &task, &agent)
+            .await
+            .unwrap();
+
+        let create_calls = mock_client.create_container_calls.lock().unwrap();
+        let env = create_calls[1].1.env.as_ref().unwrap();
+
+        let no_proxy = env
+            .iter()
+            .find(|e| e.starts_with("NO_PROXY="))
+            .expect("NO_PROXY should be set");
+        assert!(
+            !no_proxy.contains("100.64.0.0/10"),
+            "userspace mode must NOT bypass the proxy for the tailnet: {no_proxy}"
+        );
+        assert!(
+            env.contains(&"ALL_PROXY=socks5h://localhost:1055".to_string()),
+            "userspace mode should route the tailnet via the SOCKS5 proxy"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tailscale_disabled_by_default() {
+        let mock_client = Arc::new(TrackedDockerClient::default());
+        let ctx = AppContext::builder().build();
+        let manager = DockerManager::new(&ctx, mock_client.clone(), None);
+
+        let task = create_test_task(false);
+        let agent = crate::agent::ClaudeAgent::with_tsk_env(ctx.tsk_env());
+        let result = manager.run_task_container("tsk/base", &task, &agent).await;
+        assert!(result.is_ok());
+
+        let create_calls = mock_client.create_container_calls.lock().unwrap();
+        let task_config = &create_calls[1].1;
+
+        let env = task_config.env.as_ref().unwrap();
+        assert!(!env.iter().any(|e| e.starts_with("TS_AUTHKEY=")));
+        assert!(!env.iter().any(|e| e.contains("100.64.0.0/10")));
+
+        let host_config = task_config.host_config.as_ref().unwrap();
+        assert!(host_config.cap_add.is_none());
+        assert!(
+            host_config
+                .cap_drop
+                .as_ref()
+                .unwrap()
+                .contains(&"NET_ADMIN".to_string())
+        );
+
+        let cmd = task_config.cmd.as_ref().unwrap();
+        assert!(!cmd[2].contains("tsk-tailscale-up"));
+    }
+
+    #[tokio::test]
+    async fn test_tailscale_without_auth_key_fails_fast() {
+        let mock_client = Arc::new(TrackedDockerClient::default());
+        let ctx = AppContext::builder().build();
+        let manager = DockerManager::new(&ctx, mock_client.clone(), None);
+
+        let resolved = crate::context::ResolvedConfig {
+            tailscale: true,
+            tailscale_auth_key_env: Some("TSK_TEST_UNSET_TS_AUTHKEY".to_string()),
+            ..Default::default()
+        };
+        let mut task = create_test_task(false);
+        task.resolved_config = Some(serde_json::to_string(&resolved).unwrap());
+
+        let agent = crate::agent::ClaudeAgent::with_tsk_env(ctx.tsk_env());
+        let result = manager.run_task_container("tsk/base", &task, &agent).await;
+
+        let err = result.unwrap_err();
+        assert!(err.contains("TSK_TEST_UNSET_TS_AUTHKEY"), "got: {err}");
+        // No containers should have been created
+        assert!(
+            mock_client
+                .create_container_calls
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn test_resolve_tailscale_auth_key_prefers_env_over_file() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let key_file = temp_dir.path().join("ts-authkey");
+        std::fs::write(&key_file, "  from-file  ").unwrap();
+
+        let resolved = crate::context::ResolvedConfig {
+            tailscale: true,
+            tailscale_auth_key_file: Some(key_file.to_string_lossy().to_string()),
+            ..Default::default()
+        };
+
+        // Default env var name is consulted first
+        let key = resolve_tailscale_auth_key_with(&resolved, |name| {
+            (name == "TS_AUTHKEY").then(|| " from-env \n".to_string())
+        })
+        .unwrap();
+        assert_eq!(key, "from-env");
+
+        // Falls back to the key file when the env var is unset or empty
+        let key = resolve_tailscale_auth_key_with(&resolved, |_| Some(String::new())).unwrap();
+        assert_eq!(key, "from-file");
+
+        // A custom env var name is honored
+        let custom = crate::context::ResolvedConfig {
+            tailscale_auth_key_env: Some("MY_KEY".to_string()),
+            ..resolved.clone()
+        };
+        let key = resolve_tailscale_auth_key_with(&custom, |name| {
+            (name == "MY_KEY").then(|| "k".to_string())
+        })
+        .unwrap();
+        assert_eq!(key, "k");
+
+        // Neither source available: actionable error naming the env var
+        let no_sources = crate::context::ResolvedConfig {
+            tailscale: true,
+            ..Default::default()
+        };
+        let err = resolve_tailscale_auth_key_with(&no_sources, |_| None).unwrap_err();
+        assert!(err.contains("TS_AUTHKEY"), "got: {err}");
+    }
+
+    #[test]
+    fn test_resolve_tailscale_auth_key_whitespace_env_falls_through() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let key_file = temp_dir.path().join("ts-authkey");
+        std::fs::write(&key_file, "from-file").unwrap();
+        let resolved = crate::context::ResolvedConfig {
+            tailscale: true,
+            tailscale_auth_key_file: Some(key_file.to_string_lossy().to_string()),
+            ..Default::default()
+        };
+        // A whitespace-only env value is treated as empty and falls to the file.
+        let key = resolve_tailscale_auth_key_with(&resolved, |_| Some("   \n".to_string())).unwrap();
+        assert_eq!(key, "from-file");
+    }
+
+    #[test]
+    fn test_resolve_tailscale_auth_key_empty_file_errors() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let key_file = temp_dir.path().join("ts-authkey");
+        std::fs::write(&key_file, "   \n\t ").unwrap(); // whitespace only
+        let resolved = crate::context::ResolvedConfig {
+            tailscale: true,
+            tailscale_auth_key_file: Some(key_file.to_string_lossy().to_string()),
+            ..Default::default()
+        };
+        let err = resolve_tailscale_auth_key_with(&resolved, |_| None).unwrap_err();
+        assert!(err.contains("is empty"), "got: {err}");
+        assert!(err.contains("ts-authkey"), "error should name the file: {err}");
+    }
+
+    #[test]
+    fn test_resolve_tailscale_auth_key_missing_file_errors() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let missing = temp_dir.path().join("does-not-exist");
+        let resolved = crate::context::ResolvedConfig {
+            tailscale: true,
+            tailscale_auth_key_file: Some(missing.to_string_lossy().to_string()),
+            ..Default::default()
+        };
+        let err = resolve_tailscale_auth_key_with(&resolved, |_| None).unwrap_err();
+        assert!(
+            err.contains("Failed to read tailscale_auth_key_file"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_parse_tailnet_aliases() {
+        let json = serde_json::json!({
+            "Self": { "DNSName": "tsk-abc.example.ts.net.", "TailscaleIPs": ["100.83.1.1"] },
+            "Peer": {
+                "nodekey:aaa": {
+                    "DNSName": "rainier.example.ts.net.",
+                    "TailscaleIPs": ["100.81.17.123", "fd7a::1"]
+                },
+                "nodekey:bbb": { "DNSName": "db.example.ts.net.", "TailscaleIPs": ["100.90.0.9"] },
+                "nodekey:ccc": { "TailscaleIPs": [] }
+            }
+        });
+        let aliases = parse_tailnet_aliases(&json);
+        // Each valid node yields FQDN + short label, using the first (IPv4) IP.
+        assert!(aliases.contains(&"rainier.example.ts.net:100.81.17.123".to_string()));
+        assert!(aliases.contains(&"rainier:100.81.17.123".to_string()));
+        assert!(aliases.contains(&"db.example.ts.net:100.90.0.9".to_string()));
+        assert!(aliases.contains(&"db:100.90.0.9".to_string()));
+        // Self is included so a task can resolve its own node.
+        assert!(aliases.contains(&"tsk-abc.example.ts.net:100.83.1.1".to_string()));
+        // A node without a DNSName or IP is skipped, not panicked on.
+        assert!(!aliases.iter().any(|a| a.contains("ccc")));
+    }
+
+    #[test]
+    fn test_parse_tailnet_aliases_rejects_malformed() {
+        // Peer-controlled names/IPs that would produce a bad ExtraHosts line are skipped.
+        let json = serde_json::json!({
+            "Peer": {
+                "a": { "DNSName": "evil host.ts.net.", "TailscaleIPs": ["100.1.1.1"] }, // space
+                "b": { "DNSName": "ok.ts.net.", "TailscaleIPs": ["not-an-ip"] },         // bad IP
+                "c": { "DNSName": "bad:name.ts.net.", "TailscaleIPs": ["100.2.2.2"] },   // colon
+                "d": { "DNSName": "good.ts.net.", "TailscaleIPs": ["100.3.3.3"] }         // valid
+            }
+        });
+        let aliases = parse_tailnet_aliases(&json);
+        assert!(aliases.contains(&"good.ts.net:100.3.3.3".to_string()));
+        assert_eq!(aliases.iter().filter(|a| !a.starts_with("good")).count(), 0);
+    }
+
+    #[test]
+    fn test_build_extra_hosts() {
+        // Proxy only (no tailnet aliases) → just the proxy entry.
+        assert_eq!(
+            build_extra_hosts(Some("tsk-proxy:172.18.0.2".to_string()), vec![]),
+            Some(vec!["tsk-proxy:172.18.0.2".to_string()])
+        );
+        // Proxy + tailnet aliases → both, proxy first.
+        assert_eq!(
+            build_extra_hosts(
+                Some("tsk-proxy:172.18.0.2".to_string()),
+                vec!["rainier:100.81.17.123".to_string()]
+            ),
+            Some(vec![
+                "tsk-proxy:172.18.0.2".to_string(),
+                "rainier:100.81.17.123".to_string()
+            ])
+        );
+        // Nothing at all → None (keep the runtime's default /etc/hosts).
+        assert_eq!(build_extra_hosts(None, vec![]), None);
+    }
+
+    #[test]
+    fn test_with_tailscale_startup_wraps_commands() {
+        // The prefix joins the tailnet, then scrubs the secret from the env so
+        // the agent process can't read it out of /proc/self/environ.
+        const PREFIX: &str =
+            "/usr/local/bin/tsk-tailscale-up || exit 1\nunset TS_AUTHKEY TSK_TAILSCALE_UP_ARGS";
+
+        // `sh -c` commands are exec'd (as `exec sh -c <script>`) so the agent's
+        // surviving process image is replaced after the unset.
+        let wrapped = with_tailscale_startup(vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "claude --run".to_string(),
+        ]);
+        assert_eq!(
+            wrapped,
+            vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                format!("{PREFIX}\nexec 'sh' '-c' 'claude --run'"),
+            ]
+        );
+
+        // Other commands are wrapped in a shell with their arguments quoted
+        let wrapped = with_tailscale_startup(vec!["my agent".to_string(), "it's".to_string()]);
+        assert_eq!(wrapped[0], "sh");
+        assert_eq!(wrapped[2], format!("{PREFIX}\nexec 'my agent' 'it'\\''s'"));
+
+        // An empty command (image default) is left untouched
+        assert!(with_tailscale_startup(vec![]).is_empty());
+    }
+
+    #[test]
+    fn test_with_tailscale_startup_quoting_is_injection_safe() {
+        // Empty arguments must survive as '' (an empty single-quoted string),
+        // never be silently dropped — dropping one shifts the whole argv.
+        let wrapped = with_tailscale_startup(vec!["bin".to_string(), String::new()]);
+        assert!(
+            wrapped[2].ends_with("exec 'bin' ''"),
+            "empty arg must render as '', got: {}",
+            wrapped[2]
+        );
+
+        // Shell metacharacters are neutralized by single-quoting; only the
+        // single quote itself needs the '\'' escape.
+        let nasty = r#"he said "$x" `whoami` \y ; rm -rf /"#.to_string();
+        let wrapped = with_tailscale_startup(vec!["bin".to_string(), nasty.clone()]);
+        let expected = format!("exec 'bin' '{}'", nasty.replace('\'', r"'\''"));
+        assert!(
+            wrapped[2].ends_with(&expected),
+            "metachars must be quoted verbatim, got: {}",
+            wrapped[2]
+        );
+
+        // A 4-element command that merely starts with `sh -c` is NOT the
+        // in-place special case — it must take the generic quoting path so the
+        // trailing positional args are preserved.
+        let wrapped = with_tailscale_startup(vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "script".to_string(),
+            "arg0".to_string(),
+        ]);
+        assert!(
+            wrapped[2].ends_with("exec 'sh' '-c' 'script' 'arg0'"),
+            "4-arg sh -c must be fully quoted, got: {}",
+            wrapped[2]
         );
     }
 }

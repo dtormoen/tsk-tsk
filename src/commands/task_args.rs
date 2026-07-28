@@ -46,6 +46,7 @@ pub struct TaskArgs {
     pub dind: bool,
     pub privileged: bool,
     pub sudo: bool,
+    pub tailscale: bool,
     pub devices: Vec<String>,
     pub branch: Option<String>,
 }
@@ -136,6 +137,7 @@ impl TaskArgs {
             .repo_copy_source(worktree_source)
             .privileged(if self.privileged { Some(true) } else { None })
             .sudo(if self.sudo { Some(true) } else { None })
+            .tailscale(if self.tailscale { Some(true) } else { None })
             .devices(self.devices.clone())
             .branch(self.branch.clone())
     }
