@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.9](https://github.com/dtormoen/tsk-tsk/compare/v0.10.8...v0.10.9) - 2026-07-29
+
+### Added
+
+- surface warmup failures to `tsk wait` and `tsk add --wait`
+
+### Fixed
+
+- keep long agent commands in foreground in headless mode
+- wait indefinitely for Claude background tasks in headless mode
+- stop setting PYTHONPATH automatically for the python stack
+
 ## [0.10.8](https://github.com/dtormoen/tsk-tsk/compare/v0.10.7...v0.10.8) - 2026-04-03
 
 ### Added
