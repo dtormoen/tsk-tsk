@@ -1,6 +1,6 @@
 [package]
 name = "tsk-ai"
-version = "0.10.8"
+version = "0.10.9"
 edition = "2024"
 authors = ["Danny Tormoen <dtormoen@gmail.com>"]
 description = "tsk-tsk: keeping your agents out of trouble with sandboxed coding agent automation"
