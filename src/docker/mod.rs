@@ -234,17 +234,16 @@ fn parse_tailnet_aliases(json: &serde_json::Value) -> Vec<String> {
 /// Assembles the container's `ExtraHosts`: the proxy container mapping (when
 /// network isolation is on) followed by any tailnet device aliases. Returns
 /// `None` when there are no entries so the runtime keeps its default `/etc/hosts`.
-fn build_extra_hosts(proxy_entry: Option<String>, tailnet_aliases: Vec<String>) -> Option<Vec<String>> {
+fn build_extra_hosts(
+    proxy_entry: Option<String>,
+    tailnet_aliases: Vec<String>,
+) -> Option<Vec<String>> {
     let mut hosts = Vec::new();
     if let Some(entry) = proxy_entry {
         hosts.push(entry);
     }
     hosts.extend(tailnet_aliases);
-    if hosts.is_empty() {
-        None
-    } else {
-        Some(hosts)
-    }
+    if hosts.is_empty() { None } else { Some(hosts) }
 }
 
 /// Prefixes a container command with the Tailscale startup script.
@@ -460,8 +459,8 @@ impl DockerManager {
         // SOCKS5 proxy — putting the tailnet in NO_PROXY there forces a routeless
         // direct connection and breaks it. So the bypass is kernel-mode-only, and
         // userspace mode instead points ALL_PROXY at the SOCKS5 listener.
-        let tailscale_kernel_mode = resolved.tailscale
-            && self.ctx.tsk_config().container_engine == ContainerEngine::Docker;
+        let tailscale_kernel_mode =
+            resolved.tailscale && self.ctx.tsk_config().container_engine == ContainerEngine::Docker;
         let tailscale_userspace_mode = resolved.tailscale && !tailscale_kernel_mode;
 
         let no_proxy_hosts = if tailscale_kernel_mode {
@@ -875,7 +874,9 @@ impl DockerManager {
                 },
                 extra_hosts: build_extra_hosts(
                     match (proxy_config, proxy_container_ip) {
-                        (Some(pc), Some(ip)) => Some(format!("{}:{}", pc.proxy_container_name(), ip)),
+                        (Some(pc), Some(ip)) => {
+                            Some(format!("{}:{}", pc.proxy_container_name(), ip))
+                        }
                         _ => None,
                     },
                     // Tailnet device name→IP aliases (snapshotted from the host's
@@ -932,7 +933,13 @@ impl DockerManager {
         // Resolve the Tailscale auth key before any container work so a missing
         // key fails fast with an actionable message.
         let tailscale_auth_key = if resolved.tailscale {
-            Some(resolve_tailscale_auth_key(&resolved)?)
+            if resolved.has_tailscale_mint_credential() {
+                // Mint a fresh ephemeral, tagged key so the node auto-removes
+                // from the tailnet after the sandbox stops.
+                Some(crate::tailscale::mint_tailscale_auth_key(&resolved, &task.id).await?)
+            } else {
+                Some(resolve_tailscale_auth_key(&resolved)?)
+            }
         } else {
             None
         };
@@ -2551,7 +2558,8 @@ mod tests {
             ..Default::default()
         };
         // A whitespace-only env value is treated as empty and falls to the file.
-        let key = resolve_tailscale_auth_key_with(&resolved, |_| Some("   \n".to_string())).unwrap();
+        let key =
+            resolve_tailscale_auth_key_with(&resolved, |_| Some("   \n".to_string())).unwrap();
         assert_eq!(key, "from-file");
     }
 
@@ -2567,7 +2575,10 @@ mod tests {
         };
         let err = resolve_tailscale_auth_key_with(&resolved, |_| None).unwrap_err();
         assert!(err.contains("is empty"), "got: {err}");
-        assert!(err.contains("ts-authkey"), "error should name the file: {err}");
+        assert!(
+            err.contains("ts-authkey"),
+            "error should name the file: {err}"
+        );
     }
 
     #[test]

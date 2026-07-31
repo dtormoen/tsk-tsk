@@ -420,17 +420,29 @@ tailscale_auth_key_env = "TS_AUTHKEY"      # Env var holding the auth key (defau
 # tailscale_accept_routes = true            # Reach subnet-router routes (default false; see below)
 # tailscale_host_aliases = false            # Inject tailnet device names into /etc/hosts (default true)
 # tailscale_up_args = "--ssh"               # Extra `tailscale up` flags (isolation-weakening flags rejected)
+
+# --- Recommended: let tsk mint a fresh ephemeral, tagged key per task ---
+# Provide EITHER a PAT or an OAuth client (OAuth takes precedence if both set).
+# tailscale_api_key_env = "TS_API_KEY"            # env var holding a PAT (tskey-api-...)
+# tailscale_api_key_file = "~/.config/tsk/ts-api-key"
+# tailscale_oauth_client_id  = "k123..."          # OAuth client id
+# tailscale_oauth_secret_env = "TS_OAUTH_SECRET"  # env var holding the OAuth secret
+# tailscale_oauth_secret_file = "~/.config/tsk/ts-oauth-secret"
+# tailscale_tailnet = "-"                          # default "-" = credential's default tailnet
+# tailscale_tags = ["tag:tsk-sandbox"]             # tags for minted keys/nodes (default)
 ```
 
 #### Recommended auth-key setup (least privilege)
 
+The config example above shows the recommended setup: configure a Tailscale API credential and let tsk mint a fresh key per task (see "Cleanup of sandbox nodes" below). If you'd rather not grant tsk API access, you can instead bring your own key.
+
 In the Tailscale admin console, generate a **reusable, ephemeral, tagged** auth key (e.g. `tag:tsk-sandbox`) and write an ACL granting that tag access to only the specific hosts/ports an agent should reach. You mint this **once** and reuse it across every task — it is the primary control:
 
 - **Reusable** → one key authenticates every sandbox; you don't mint a key per task.
-- **Ephemeral** → each sandbox node auto-removes itself when the task ends (no stale `tsk-*` nodes piling up on your tailnet).
+- **Ephemeral** → each sandbox node auto-removes itself a few minutes after the task ends (no stale `tsk-*` nodes piling up on your tailnet). Letting tsk mint the key per task (above) is the more robust way to guarantee this, since a manually-created key only stays ephemeral if you remember to set that flag every time you regenerate it.
 - **Tagged + ACL-scoped** → the sandbox is limited to what the tag is allowed, *independently of your personal identity* — the tag is what does the scoping. An **untagged** key (reusable or not) gives every sandbox **your full personal tailnet access**, so always tag it.
 
-Set a sensible expiry on the key and rotate it like any other secret. (The key lives on the trusted host, not in the sandbox — see below.) For a fully hands-off setup you could instead mint a fresh short-lived key per task from a [Tailscale OAuth client](https://tailscale.com/kb/1215/oauth-clients); tsk doesn't do that yet, so a reusable key is the practical choice today.
+Set a sensible expiry on the key and rotate it like any other secret. (The key lives on the trusted host, not in the sandbox — see below.)
 
 Supply the key from your environment (or a key file) — never commit one:
 
@@ -438,6 +450,8 @@ Supply the key from your environment (or a key file) — never commit one:
 export TS_AUTHKEY="tskey-auth-..."
 tsk run --tailscale -t feat -n sync-schema -p "Sync the schema from the staging database"
 ```
+
+**Cleanup of sandbox nodes.** Each sandbox joins as a `tsk-<task-id>` node. To keep the admin console from filling up with old nodes, the node must be **ephemeral** — Tailscale then auto-removes it a few minutes after the sandbox stops. The most robust way is to let tsk **mint the key**: configure a Tailscale API credential (a one-click **personal access token**, or an **OAuth client** for non-expiring, tightly-scoped access, via `tailscale_api_key_env` / `tailscale_oauth_client_id`) and tsk creates a fresh single-use, ephemeral, tagged key per task — so nodes are always tagged (`tag:tsk-sandbox` by default) and always auto-remove, with no way to misconfigure them. There's no default env var for the mint credential — minting only kicks in once you configure one of the fields above. If you instead bring your own key (`TS_AUTHKEY` / `tailscale_auth_key_file`), you are responsible for making it **ephemeral and tagged**; a non-ephemeral or untagged key leaves nodes behind and attributes them to your personal identity (the sandbox prints a warning when it detects an untagged node). A manually-generated reusable key remains a practical fallback, but minting is the robust, hands-off option.
 
 How it works:
 

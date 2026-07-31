@@ -177,6 +177,27 @@ impl TskConfig {
         if let Some(ref up_args) = config.tailscale_up_args {
             resolved.tailscale_up_args = Some(up_args.clone());
         }
+        if let Some(ref v) = config.tailscale_api_key_env {
+            resolved.tailscale_api_key_env = Some(v.clone());
+        }
+        if let Some(ref v) = config.tailscale_api_key_file {
+            resolved.tailscale_api_key_file = Some(v.clone());
+        }
+        if let Some(ref v) = config.tailscale_oauth_client_id {
+            resolved.tailscale_oauth_client_id = Some(v.clone());
+        }
+        if let Some(ref v) = config.tailscale_oauth_secret_env {
+            resolved.tailscale_oauth_secret_env = Some(v.clone());
+        }
+        if let Some(ref v) = config.tailscale_oauth_secret_file {
+            resolved.tailscale_oauth_secret_file = Some(v.clone());
+        }
+        if let Some(ref v) = config.tailscale_tailnet {
+            resolved.tailscale_tailnet = Some(v.clone());
+        }
+        if let Some(ref v) = config.tailscale_tags {
+            resolved.tailscale_tags = Some(v.clone());
+        }
 
         // host_ports: combine, deduplicate
         for &port in &config.host_ports {
@@ -322,6 +343,23 @@ pub struct SharedConfig {
     /// (e.g. `--exit-node`, `--advertise-routes`) are rejected — see
     /// [`validate_tailscale_up_args`].
     pub tailscale_up_args: Option<String>,
+    /// Name of the environment variable holding a Tailscale API access token
+    /// (PAT) used to mint a per-task ephemeral auth key. Setting this (or
+    /// `tailscale_api_key_file` / `tailscale_oauth_client_id`) opts into minting.
+    pub tailscale_api_key_env: Option<String>,
+    /// Path to a file containing a Tailscale API access token (PAT), `~`-expanded.
+    pub tailscale_api_key_file: Option<String>,
+    /// OAuth client ID used to mint per-task ephemeral auth keys. Takes
+    /// precedence over the PAT fields when set.
+    pub tailscale_oauth_client_id: Option<String>,
+    /// Name of the environment variable holding the OAuth client secret.
+    pub tailscale_oauth_secret_env: Option<String>,
+    /// Path to a file containing the OAuth client secret, `~`-expanded.
+    pub tailscale_oauth_secret_file: Option<String>,
+    /// Tailnet to mint keys in (default: `-`, the credential's default tailnet).
+    pub tailscale_tailnet: Option<String>,
+    /// Tags applied to minted keys/nodes (default: `["tag:tsk-sandbox"]`).
+    pub tailscale_tags: Option<Vec<String>>,
 }
 
 /// Per-stack configuration (e.g., custom Dockerfile setup commands)
@@ -402,6 +440,27 @@ pub struct ResolvedConfig {
     /// Extra arguments appended to `tailscale up`
     #[serde(default)]
     pub tailscale_up_args: Option<String>,
+    /// Env var holding a Tailscale API access token (PAT) for minting.
+    #[serde(default)]
+    pub tailscale_api_key_env: Option<String>,
+    /// File holding a Tailscale API access token (PAT) for minting.
+    #[serde(default)]
+    pub tailscale_api_key_file: Option<String>,
+    /// OAuth client ID for minting per-task ephemeral auth keys.
+    #[serde(default)]
+    pub tailscale_oauth_client_id: Option<String>,
+    /// Env var holding the OAuth client secret.
+    #[serde(default)]
+    pub tailscale_oauth_secret_env: Option<String>,
+    /// File holding the OAuth client secret.
+    #[serde(default)]
+    pub tailscale_oauth_secret_file: Option<String>,
+    /// Tailnet to mint keys in (default resolved via accessor to `-`).
+    #[serde(default)]
+    pub tailscale_tailnet: Option<String>,
+    /// Tags applied to minted keys/nodes (default resolved via accessor).
+    #[serde(default)]
+    pub tailscale_tags: Option<Vec<String>>,
 }
 
 /// serde default for `bool` fields that default to `true`.
@@ -435,6 +494,13 @@ impl Default for ResolvedConfig {
             tailscale_accept_routes: false,
             tailscale_host_aliases: true,
             tailscale_up_args: None,
+            tailscale_api_key_env: None,
+            tailscale_api_key_file: None,
+            tailscale_oauth_client_id: None,
+            tailscale_oauth_secret_env: None,
+            tailscale_oauth_secret_file: None,
+            tailscale_tailnet: None,
+            tailscale_tags: None,
         }
     }
 }
@@ -497,6 +563,29 @@ impl ResolvedConfig {
         self.tailscale_auth_key_env
             .as_deref()
             .unwrap_or(DEFAULT_TAILSCALE_AUTH_KEY_ENV)
+    }
+
+    /// Whether a Tailscale API mint credential (PAT or OAuth) is configured.
+    /// When true, tsk mints a per-task ephemeral key instead of using a
+    /// bring-your-own key.
+    pub fn has_tailscale_mint_credential(&self) -> bool {
+        self.tailscale_oauth_client_id.is_some()
+            || self.tailscale_oauth_secret_env.is_some()
+            || self.tailscale_oauth_secret_file.is_some()
+            || self.tailscale_api_key_env.is_some()
+            || self.tailscale_api_key_file.is_some()
+    }
+
+    /// Tailnet to mint keys in (default `-`, the credential's default tailnet).
+    pub fn tailscale_tailnet(&self) -> &str {
+        self.tailscale_tailnet.as_deref().unwrap_or("-")
+    }
+
+    /// Tags applied to minted keys/nodes (default `["tag:tsk-sandbox"]`).
+    pub fn tailscale_tags(&self) -> Vec<String> {
+        self.tailscale_tags
+            .clone()
+            .unwrap_or_else(|| vec![crate::tailscale::DEFAULT_TAILSCALE_TAG.to_string()])
     }
 
     /// Hostname the sandbox registers on the tailnet.
@@ -574,7 +663,11 @@ pub fn validate_tailscale_up_args(args: &str) -> Result<(), String> {
         }
         // Normalize: drop leading dashes and any `=value`, so `-exit-node=x`,
         // `--exit-node x`, and `--exit-node` all reduce to `exit-node`.
-        let bare = token.trim_start_matches('-').split('=').next().unwrap_or("");
+        let bare = token
+            .trim_start_matches('-')
+            .split('=')
+            .next()
+            .unwrap_or("");
         if DENIED_TAILSCALE_UP_FLAGS.contains(&bare) {
             return Err(format!(
                 "tailscale_up_args may not contain `{token}`: it would weaken the sandbox's \
@@ -1986,6 +2079,13 @@ setup = "RUN pip install numpy"
             tailscale_accept_routes: true,
             tailscale_host_aliases: true,
             tailscale_up_args: Some("--ssh".to_string()),
+            tailscale_api_key_env: Some("TS_API_KEY".to_string()),
+            tailscale_api_key_file: Some("~/.config/tsk/ts-api-key".to_string()),
+            tailscale_oauth_client_id: Some("kABC123".to_string()),
+            tailscale_oauth_secret_env: Some("TS_OAUTH_SECRET".to_string()),
+            tailscale_oauth_secret_file: Some("~/.config/tsk/ts-oauth-secret".to_string()),
+            tailscale_tailnet: Some("example.com".to_string()),
+            tailscale_tags: Some(vec!["tag:tsk-sandbox".to_string()]),
         };
 
         let json = serde_json::to_string(&config).unwrap();
@@ -2021,6 +2121,34 @@ setup = "RUN pip install numpy"
         );
         assert_eq!(deserialized.tailscale_hostname_for("abc123"), "sandbox");
         assert_eq!(deserialized.tailscale_up_args, Some("--ssh".to_string()));
+        assert_eq!(
+            deserialized.tailscale_api_key_env,
+            Some("TS_API_KEY".to_string())
+        );
+        assert_eq!(
+            deserialized.tailscale_api_key_file,
+            Some("~/.config/tsk/ts-api-key".to_string())
+        );
+        assert_eq!(
+            deserialized.tailscale_oauth_client_id,
+            Some("kABC123".to_string())
+        );
+        assert_eq!(
+            deserialized.tailscale_oauth_secret_env,
+            Some("TS_OAUTH_SECRET".to_string())
+        );
+        assert_eq!(
+            deserialized.tailscale_oauth_secret_file,
+            Some("~/.config/tsk/ts-oauth-secret".to_string())
+        );
+        assert_eq!(
+            deserialized.tailscale_tailnet,
+            Some("example.com".to_string())
+        );
+        assert_eq!(
+            deserialized.tailscale_tags,
+            Some(vec!["tag:tsk-sandbox".to_string()])
+        );
 
         // Snapshots written before Tailscale support deserialize with it off
         let legacy: ResolvedConfig = serde_json::from_str(
@@ -2090,6 +2218,83 @@ tailscale = false
             default_resolved.tailscale_hostname_for("abc123"),
             "tsk-abc123"
         );
+    }
+
+    #[test]
+    fn test_tailscale_mint_config_layering() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let config_dir = temp_dir.path();
+
+        let toml_content = r#"
+[defaults]
+tailscale = true
+tailscale_oauth_client_id = "kABC123"
+tailscale_oauth_secret_env = "TS_OAUTH_SECRET"
+tailscale_tailnet = "example.com"
+tailscale_tags = ["tag:tsk-sandbox"]
+"#;
+        std::fs::write(config_dir.join("tsk.toml"), toml_content).unwrap();
+        let config = load_config(config_dir);
+
+        let resolved = config.resolve_config("any-project", None, None);
+        assert_eq!(
+            resolved.tailscale_oauth_client_id.as_deref(),
+            Some("kABC123")
+        );
+        assert_eq!(
+            resolved.tailscale_oauth_secret_env.as_deref(),
+            Some("TS_OAUTH_SECRET")
+        );
+        assert_eq!(resolved.tailscale_tailnet.as_deref(), Some("example.com"));
+        assert_eq!(
+            resolved.tailscale_tags,
+            Some(vec!["tag:tsk-sandbox".to_string()])
+        );
+        // Unset PAT fields stay None.
+        assert!(resolved.tailscale_api_key_env.is_none());
+        assert!(resolved.tailscale_api_key_file.is_none());
+    }
+
+    #[test]
+    fn test_has_tailscale_mint_credential() {
+        let none = ResolvedConfig::default();
+        assert!(!none.has_tailscale_mint_credential());
+
+        let pat = ResolvedConfig {
+            tailscale_api_key_env: Some("TS_API_KEY".to_string()),
+            ..Default::default()
+        };
+        assert!(pat.has_tailscale_mint_credential());
+
+        let oauth = ResolvedConfig {
+            tailscale_oauth_client_id: Some("kABC".to_string()),
+            ..Default::default()
+        };
+        assert!(oauth.has_tailscale_mint_credential());
+
+        let oauth_secret_only = ResolvedConfig {
+            tailscale_oauth_secret_env: Some("TS_OAUTH_SECRET".to_string()),
+            ..Default::default()
+        };
+        assert!(oauth_secret_only.has_tailscale_mint_credential());
+    }
+
+    #[test]
+    fn test_tailscale_tailnet_and_tags_defaults() {
+        let resolved = ResolvedConfig::default();
+        assert_eq!(resolved.tailscale_tailnet(), "-");
+        assert_eq!(
+            resolved.tailscale_tags(),
+            vec!["tag:tsk-sandbox".to_string()]
+        );
+
+        let custom = ResolvedConfig {
+            tailscale_tailnet: Some("example.com".to_string()),
+            tailscale_tags: Some(vec!["tag:ci".to_string()]),
+            ..Default::default()
+        };
+        assert_eq!(custom.tailscale_tailnet(), "example.com");
+        assert_eq!(custom.tailscale_tags(), vec!["tag:ci".to_string()]);
     }
 
     #[test]

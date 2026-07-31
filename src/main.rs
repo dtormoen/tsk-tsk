@@ -15,6 +15,7 @@ mod repo_utils;
 mod repository;
 mod server;
 mod stdin_utils;
+mod tailscale;
 mod task;
 mod task_builder;
 mod task_manager;

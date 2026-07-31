@@ -65,6 +65,13 @@ RUN printf '%s\n' \
     '    --hostname "${TSK_TAILSCALE_HOSTNAME:-tsk}" \' \
     '    --accept-dns=false $ACCEPT_ROUTES ${TSK_TAILSCALE_UP_ARGS:-}' \
     'tailscale --socket="$SOCKET" status' \
+    '# Warn on an untagged node: it uses your personal tailnet identity and,' \
+    '# with a non-ephemeral key, will not auto-remove. Minted keys are always tagged.' \
+    'if tailscale --socket="$SOCKET" status --json | jq -e "((.Self.Tags // []) | length) == 0" >/dev/null 2>&1; then' \
+    '    echo "tsk: WARNING - this sandbox node is UNTAGGED and uses your personal tailnet identity."' \
+    '    echo "tsk:          Use a tagged, ephemeral auth key or configure key minting so nodes are"' \
+    '    echo "tsk:          tagged and auto-remove. See the README Tailscale section."' \
+    'fi' \
     > /usr/local/bin/tsk-tailscale-up && \
     chmod 0755 /usr/local/bin/tsk-tailscale-up
 USER agent
