@@ -43,6 +43,7 @@ pub struct TaskBuilder {
     dind: Option<bool>,
     privileged: Option<bool>,
     sudo: Option<bool>,
+    tailscale: Option<bool>,
     devices: Vec<String>,
     repo_copy_source: Option<PathBuf>,
     branch: Option<String>,
@@ -69,6 +70,7 @@ impl TaskBuilder {
             dind: None,
             privileged: None,
             sudo: None,
+            tailscale: None,
             devices: Vec::new(),
             repo_copy_source: None,
             branch: None,
@@ -96,6 +98,7 @@ impl TaskBuilder {
         {
             builder.privileged = Some(config.privileged);
             builder.sudo = Some(config.sudo);
+            builder.tailscale = Some(config.tailscale);
             builder.devices = config.devices;
         }
         // Note: We intentionally don't copy parent_id when retrying a task.
@@ -208,6 +211,13 @@ impl TaskBuilder {
     /// Uses `Option<bool>` so `None` defers to config-file defaults.
     pub fn sudo(mut self, enabled: Option<bool>) -> Self {
         self.sudo = enabled;
+        self
+    }
+
+    /// Sets whether the container joins the user's Tailscale tailnet.
+    /// Uses `Option<bool>` so `None` defers to config-file defaults.
+    pub fn tailscale(mut self, enabled: Option<bool>) -> Self {
+        self.tailscale = enabled;
         self
     }
 
@@ -438,6 +448,27 @@ impl TaskBuilder {
 
         // Resolve sudo: CLI flag > resolved config (project > defaults > built-in)
         resolved.sudo = self.sudo.unwrap_or(resolved.sudo);
+
+        // Resolve tailscale: CLI flag > resolved config (project > defaults > built-in)
+        resolved.tailscale = self.tailscale.unwrap_or(resolved.tailscale);
+
+        // Reject isolation-weakening flags in tailscale_up_args before the task
+        // is ever queued, so a bad config fails loudly at creation time.
+        if resolved.tailscale {
+            // Tailscale relies on the isolated-network topology (the tailnet is
+            // the only extra egress; NO_PROXY bypasses assume no other route
+            // out). Without network isolation those bypasses could combine with
+            // an open host network, so require isolation to be on.
+            if !self.network_isolation {
+                return Err("Tailscale requires network isolation to be enabled \
+                    (it relies on the isolated-network topology); \
+                    remove --no-network-isolation or disable Tailscale."
+                    .into());
+            }
+            if let Some(ref up_args) = resolved.tailscale_up_args {
+                crate::context::tsk_config::validate_tailscale_up_args(up_args)?;
+            }
+        }
 
         // Merge CLI devices into resolved config (deduplicated)
         for device in &self.devices {
@@ -1366,6 +1397,134 @@ mod tests {
             .await
             .unwrap();
         assert!(task.dind, "CLI --dind should override project.dind = false");
+    }
+
+    #[tokio::test]
+    async fn test_tailscale_config_resolution_chain() {
+        use crate::context::{ResolvedConfig, SharedConfig, TskConfig};
+        use crate::test_utils::TestGitRepository;
+        use std::collections::HashMap;
+
+        let test_repo = TestGitRepository::new().unwrap();
+        test_repo.init_with_commit().unwrap();
+        let repo_path = test_repo.path().to_path_buf();
+        let project_name = "test-project".to_string();
+
+        let snapshot = |task: &Task| -> ResolvedConfig {
+            serde_json::from_str(task.resolved_config.as_ref().unwrap()).unwrap()
+        };
+
+        // Off by default
+        let ctx = AppContext::builder().build();
+        let task = TaskBuilder::new()
+            .repo_root(repo_path.clone())
+            .name("tailscale-default".to_string())
+            .prompt(Some("Test".to_string()))
+            .build(&ctx)
+            .await
+            .unwrap();
+        assert!(!snapshot(&task).tailscale, "Tailscale should be opt-in");
+
+        // Config enables it, and auth key settings flow into the snapshot
+        let tsk_config = TskConfig {
+            defaults: SharedConfig {
+                tailscale: Some(true),
+                tailscale_auth_key_env: Some("MY_TS_KEY".to_string()),
+                ..Default::default()
+            },
+            project: HashMap::from([(
+                project_name.clone(),
+                SharedConfig {
+                    tailscale: Some(false),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+        let ctx = AppContext::builder().with_tsk_config(tsk_config).build();
+
+        let task = TaskBuilder::new()
+            .repo_root(repo_path.clone())
+            .name("tailscale-project-override".to_string())
+            .prompt(Some("Test".to_string()))
+            .project(Some(project_name.clone()))
+            .build(&ctx)
+            .await
+            .unwrap();
+        let config = snapshot(&task);
+        assert!(
+            !config.tailscale,
+            "project tailscale = false should override defaults"
+        );
+        assert_eq!(config.tailscale_auth_key_env_var(), "MY_TS_KEY");
+
+        // CLI flag wins over config
+        let task = TaskBuilder::new()
+            .repo_root(repo_path)
+            .name("tailscale-cli-override".to_string())
+            .prompt(Some("Test".to_string()))
+            .project(Some(project_name))
+            .tailscale(Some(true))
+            .build(&ctx)
+            .await
+            .unwrap();
+        assert!(
+            snapshot(&task).tailscale,
+            "--tailscale should override project config"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tailscale_up_args_denylist_rejected_at_build() {
+        use crate::context::{SharedConfig, TskConfig};
+        use crate::test_utils::TestGitRepository;
+
+        let test_repo = TestGitRepository::new().unwrap();
+        test_repo.init_with_commit().unwrap();
+        let repo_path = test_repo.path().to_path_buf();
+
+        // An isolation-weakening flag in tailscale_up_args must fail task creation.
+        let tsk_config = TskConfig {
+            defaults: SharedConfig {
+                tailscale: Some(true),
+                tailscale_up_args: Some("--exit-node=100.64.0.1".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let ctx = AppContext::builder().with_tsk_config(tsk_config).build();
+
+        let result = TaskBuilder::new()
+            .repo_root(repo_path)
+            .name("bad-up-args".to_string())
+            .prompt(Some("Test".to_string()))
+            .build(&ctx)
+            .await;
+
+        let err = result.expect_err("build should reject --exit-node in up_args");
+        assert!(err.to_string().contains("network isolation"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_tailscale_requires_network_isolation() {
+        use crate::test_utils::TestGitRepository;
+
+        let test_repo = TestGitRepository::new().unwrap();
+        test_repo.init_with_commit().unwrap();
+        let repo_path = test_repo.path().to_path_buf();
+
+        let ctx = AppContext::builder().build();
+        let result = TaskBuilder::new()
+            .repo_root(repo_path)
+            .name("ts-no-isolation".to_string())
+            .prompt(Some("Test".to_string()))
+            .tailscale(Some(true))
+            .network_isolation(false)
+            .build(&ctx)
+            .await;
+
+        let err = result.expect_err("tailscale without network isolation should fail");
+        assert!(err.to_string().contains("network isolation"), "got: {err}");
     }
 
     #[tokio::test]

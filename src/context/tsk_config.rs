@@ -156,6 +156,48 @@ impl TskConfig {
         if let Some(ref squid_conf) = config.squid_conf {
             resolved.squid_conf = Some(squid_conf.clone());
         }
+        if let Some(tailscale) = config.tailscale {
+            resolved.tailscale = tailscale;
+        }
+        if let Some(ref env_var) = config.tailscale_auth_key_env {
+            resolved.tailscale_auth_key_env = Some(env_var.clone());
+        }
+        if let Some(ref key_file) = config.tailscale_auth_key_file {
+            resolved.tailscale_auth_key_file = Some(key_file.clone());
+        }
+        if let Some(ref hostname) = config.tailscale_hostname {
+            resolved.tailscale_hostname = Some(hostname.clone());
+        }
+        if let Some(accept_routes) = config.tailscale_accept_routes {
+            resolved.tailscale_accept_routes = accept_routes;
+        }
+        if let Some(host_aliases) = config.tailscale_host_aliases {
+            resolved.tailscale_host_aliases = host_aliases;
+        }
+        if let Some(ref up_args) = config.tailscale_up_args {
+            resolved.tailscale_up_args = Some(up_args.clone());
+        }
+        if let Some(ref v) = config.tailscale_api_key_env {
+            resolved.tailscale_api_key_env = Some(v.clone());
+        }
+        if let Some(ref v) = config.tailscale_api_key_file {
+            resolved.tailscale_api_key_file = Some(v.clone());
+        }
+        if let Some(ref v) = config.tailscale_oauth_client_id {
+            resolved.tailscale_oauth_client_id = Some(v.clone());
+        }
+        if let Some(ref v) = config.tailscale_oauth_secret_env {
+            resolved.tailscale_oauth_secret_env = Some(v.clone());
+        }
+        if let Some(ref v) = config.tailscale_oauth_secret_file {
+            resolved.tailscale_oauth_secret_file = Some(v.clone());
+        }
+        if let Some(ref v) = config.tailscale_tailnet {
+            resolved.tailscale_tailnet = Some(v.clone());
+        }
+        if let Some(ref v) = config.tailscale_tags {
+            resolved.tailscale_tags = Some(v.clone());
+        }
 
         // host_ports: combine, deduplicate
         for &port in &config.host_ports {
@@ -276,6 +318,48 @@ pub struct SharedConfig {
     pub squid_conf: Option<String>,
     /// Path to a Squid proxy configuration file
     pub squid_conf_path: Option<String>,
+    /// Join containers to the user's Tailscale tailnet (opt-in, default: false)
+    pub tailscale: Option<bool>,
+    /// Name of the environment variable holding the Tailscale auth key
+    /// (default: `TS_AUTHKEY`)
+    pub tailscale_auth_key_env: Option<String>,
+    /// Path to a file containing the Tailscale auth key (supports `~` expansion)
+    pub tailscale_auth_key_file: Option<String>,
+    /// Hostname to register on the tailnet (default: `tsk-<task-id>`)
+    pub tailscale_hostname: Option<String>,
+    /// Accept subnet routes advertised on the tailnet (default: false).
+    ///
+    /// Off by default because accepted routes are reachable from the sandbox
+    /// *over the tailnet, bypassing the Squid allowlist*. Only enable it when
+    /// you intend the sandbox to reach subnets behind a tailnet subnet router.
+    pub tailscale_accept_routes: Option<bool>,
+    /// Populate `/etc/hosts` with tailnet device name→IP aliases (default: true).
+    ///
+    /// tsk snapshots the peers visible to the host's `tailscale status` at task
+    /// creation so agents can reach tailnet devices by name, not just IP. Turn
+    /// off to keep the sandbox from learning your tailnet's device names/IPs.
+    pub tailscale_host_aliases: Option<bool>,
+    /// Extra arguments appended to `tailscale up`. Isolation-weakening flags
+    /// (e.g. `--exit-node`, `--advertise-routes`) are rejected — see
+    /// [`validate_tailscale_up_args`].
+    pub tailscale_up_args: Option<String>,
+    /// Name of the environment variable holding a Tailscale API access token
+    /// (PAT) used to mint a per-task ephemeral auth key. Setting this (or
+    /// `tailscale_api_key_file` / `tailscale_oauth_client_id`) opts into minting.
+    pub tailscale_api_key_env: Option<String>,
+    /// Path to a file containing a Tailscale API access token (PAT), `~`-expanded.
+    pub tailscale_api_key_file: Option<String>,
+    /// OAuth client ID used to mint per-task ephemeral auth keys. Takes
+    /// precedence over the PAT fields when set.
+    pub tailscale_oauth_client_id: Option<String>,
+    /// Name of the environment variable holding the OAuth client secret.
+    pub tailscale_oauth_secret_env: Option<String>,
+    /// Path to a file containing the OAuth client secret, `~`-expanded.
+    pub tailscale_oauth_secret_file: Option<String>,
+    /// Tailnet to mint keys in (default: `-`, the credential's default tailnet).
+    pub tailscale_tailnet: Option<String>,
+    /// Tags applied to minted keys/nodes (default: `["tag:tsk-sandbox"]`).
+    pub tailscale_tags: Option<Vec<String>>,
 }
 
 /// Per-stack configuration (e.g., custom Dockerfile setup commands)
@@ -335,6 +419,53 @@ pub struct ResolvedConfig {
     pub env: Vec<EnvVar>,
     /// Resolved Squid proxy configuration content
     pub squid_conf: Option<String>,
+    /// Join containers to the user's Tailscale tailnet (default: false)
+    #[serde(default)]
+    pub tailscale: bool,
+    /// Name of the environment variable holding the Tailscale auth key
+    #[serde(default)]
+    pub tailscale_auth_key_env: Option<String>,
+    /// Path to a file containing the Tailscale auth key
+    #[serde(default)]
+    pub tailscale_auth_key_file: Option<String>,
+    /// Hostname to register on the tailnet
+    #[serde(default)]
+    pub tailscale_hostname: Option<String>,
+    /// Accept subnet routes advertised on the tailnet (default: false)
+    #[serde(default)]
+    pub tailscale_accept_routes: bool,
+    /// Populate `/etc/hosts` with tailnet device name→IP aliases (default: true)
+    #[serde(default = "default_true")]
+    pub tailscale_host_aliases: bool,
+    /// Extra arguments appended to `tailscale up`
+    #[serde(default)]
+    pub tailscale_up_args: Option<String>,
+    /// Env var holding a Tailscale API access token (PAT) for minting.
+    #[serde(default)]
+    pub tailscale_api_key_env: Option<String>,
+    /// File holding a Tailscale API access token (PAT) for minting.
+    #[serde(default)]
+    pub tailscale_api_key_file: Option<String>,
+    /// OAuth client ID for minting per-task ephemeral auth keys.
+    #[serde(default)]
+    pub tailscale_oauth_client_id: Option<String>,
+    /// Env var holding the OAuth client secret.
+    #[serde(default)]
+    pub tailscale_oauth_secret_env: Option<String>,
+    /// File holding the OAuth client secret.
+    #[serde(default)]
+    pub tailscale_oauth_secret_file: Option<String>,
+    /// Tailnet to mint keys in (default resolved via accessor to `-`).
+    #[serde(default)]
+    pub tailscale_tailnet: Option<String>,
+    /// Tags applied to minted keys/nodes (default resolved via accessor).
+    #[serde(default)]
+    pub tailscale_tags: Option<Vec<String>>,
+}
+
+/// serde default for `bool` fields that default to `true`.
+fn default_true() -> bool {
+    true
 }
 
 impl Default for ResolvedConfig {
@@ -356,6 +487,20 @@ impl Default for ResolvedConfig {
             volumes: Vec::new(),
             env: Vec::new(),
             squid_conf: None,
+            tailscale: false,
+            tailscale_auth_key_env: None,
+            tailscale_auth_key_file: None,
+            tailscale_hostname: None,
+            tailscale_accept_routes: false,
+            tailscale_host_aliases: true,
+            tailscale_up_args: None,
+            tailscale_api_key_env: None,
+            tailscale_api_key_file: None,
+            tailscale_oauth_client_id: None,
+            tailscale_oauth_secret_env: None,
+            tailscale_oauth_secret_file: None,
+            tailscale_tailnet: None,
+            tailscale_tags: None,
         }
     }
 }
@@ -393,13 +538,181 @@ impl ResolvedConfig {
         !self.host_ports.is_empty()
     }
 
-    /// Extract proxy-specific configuration for fingerprinting and proxy management
+    /// Extract proxy-specific configuration for fingerprinting and proxy management.
+    ///
+    /// When Tailscale is enabled, the Squid configuration is extended with rules
+    /// allowing Tailscale's control plane and relays so `tailscaled` can come up
+    /// inside the sandbox. This changes the proxy fingerprint, so Tailscale tasks
+    /// get their own proxy container.
     pub fn proxy_config(&self) -> ResolvedProxyConfig {
+        let squid_conf = if self.tailscale {
+            Some(tailscale_squid_conf(self.squid_conf.as_deref()))
+        } else {
+            self.squid_conf.clone()
+        };
         ResolvedProxyConfig {
             host_ports: self.host_ports.clone(),
-            squid_conf: self.squid_conf.clone(),
+            squid_conf,
         }
     }
+
+    /// Name of the environment variable that holds the Tailscale auth key.
+    ///
+    /// Defaults to [`DEFAULT_TAILSCALE_AUTH_KEY_ENV`] when unset.
+    pub fn tailscale_auth_key_env_var(&self) -> &str {
+        self.tailscale_auth_key_env
+            .as_deref()
+            .unwrap_or(DEFAULT_TAILSCALE_AUTH_KEY_ENV)
+    }
+
+    /// Whether a Tailscale API mint credential (PAT or OAuth) is configured.
+    /// When true, tsk mints a per-task ephemeral key instead of using a
+    /// bring-your-own key.
+    pub fn has_tailscale_mint_credential(&self) -> bool {
+        self.tailscale_oauth_client_id.is_some()
+            || self.tailscale_oauth_secret_env.is_some()
+            || self.tailscale_oauth_secret_file.is_some()
+            || self.tailscale_api_key_env.is_some()
+            || self.tailscale_api_key_file.is_some()
+    }
+
+    /// Tailnet to mint keys in (default `-`, the credential's default tailnet).
+    pub fn tailscale_tailnet(&self) -> &str {
+        self.tailscale_tailnet.as_deref().unwrap_or("-")
+    }
+
+    /// Tags applied to minted keys/nodes (default `["tag:tsk-sandbox"]`).
+    pub fn tailscale_tags(&self) -> Vec<String> {
+        self.tailscale_tags
+            .clone()
+            .unwrap_or_else(|| vec![crate::tailscale::DEFAULT_TAILSCALE_TAG.to_string()])
+    }
+
+    /// Hostname the sandbox registers on the tailnet.
+    ///
+    /// Defaults to `tsk-<task-id>` so each sandbox is identifiable on the tailnet.
+    /// The result is sanitized to a DNS-label-safe form so it matches what
+    /// Tailscale actually registers (task IDs may contain `_`/uppercase, which
+    /// Tailscale silently rewrites — leaving logs and the tailnet out of sync).
+    pub fn tailscale_hostname_for(&self, task_id: &str) -> String {
+        let raw = self
+            .tailscale_hostname
+            .clone()
+            .unwrap_or_else(|| format!("tsk-{task_id}"));
+        sanitize_tailscale_hostname(&raw)
+    }
+}
+
+/// Sanitizes a string into a DNS-label-safe tailnet hostname so it matches what
+/// Tailscale actually registers: lowercase ASCII alphanumerics kept, every other
+/// character folded to `-`, runs of `-` collapsed, leading/trailing dashes
+/// trimmed, and truncated to the 63-char DNS-label limit. Falls back to `tsk` if
+/// nothing usable remains.
+fn sanitize_tailscale_hostname(name: &str) -> String {
+    let mut out = String::with_capacity(name.len().min(63));
+    for c in name.chars() {
+        let mapped = if c.is_ascii_alphanumeric() {
+            c.to_ascii_lowercase()
+        } else {
+            '-'
+        };
+        // Collapse runs of dashes.
+        if mapped == '-' && out.ends_with('-') {
+            continue;
+        }
+        out.push(mapped);
+    }
+    let trimmed = out.trim_matches('-');
+    let capped: String = trimmed.chars().take(63).collect();
+    let capped = capped.trim_end_matches('-');
+    if capped.is_empty() {
+        "tsk".to_string()
+    } else {
+        capped.to_string()
+    }
+}
+
+/// Flags that must not be passed through `tailscale_up_args` because they would
+/// weaken or bypass the sandbox's network isolation. `--accept-routes` has its
+/// own typed config field (`tailscale_accept_routes`) and must not be set here.
+/// Stored without leading dashes — Tailscale's Go flag parser treats `-flag` and
+/// `--flag` identically, so matching is done on the bare name.
+///
+/// This is a best-effort operator footgun-guard, not a security boundary: the
+/// agent owns the `tailscaled` socket and can reconfigure the tailnet at runtime
+/// regardless (see docs/network-isolation.md). The real boundary is your
+/// Tailscale ACLs + a tagged, ephemeral key.
+pub const DENIED_TAILSCALE_UP_FLAGS: &[&str] = &[
+    "exit-node",
+    "exit-node-allow-lan-access",
+    "advertise-exit-node",
+    "advertise-routes",
+    "accept-routes",
+    "accept-dns",
+    "netfilter-mode",
+];
+
+/// Validates operator-supplied `tailscale up` arguments, rejecting flags that
+/// would weaken the sandbox's isolation (exit nodes, route advertisement,
+/// re-enabling DNS, etc.). Accepts `--flag value`, `--flag=value`, and the
+/// single-dash `-flag` spellings Tailscale's flag parser also honors.
+pub fn validate_tailscale_up_args(args: &str) -> Result<(), String> {
+    for token in args.split_whitespace() {
+        if !token.starts_with('-') {
+            continue;
+        }
+        // Normalize: drop leading dashes and any `=value`, so `-exit-node=x`,
+        // `--exit-node x`, and `--exit-node` all reduce to `exit-node`.
+        let bare = token
+            .trim_start_matches('-')
+            .split('=')
+            .next()
+            .unwrap_or("");
+        if DENIED_TAILSCALE_UP_FLAGS.contains(&bare) {
+            return Err(format!(
+                "tailscale_up_args may not contain `{token}`: it would weaken the sandbox's \
+                 network isolation. Use the `tailscale_accept_routes` config field to reach \
+                 subnet routes; exit nodes and route advertisement are not supported for sandboxes."
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Default environment variable consulted for the Tailscale auth key.
+pub const DEFAULT_TAILSCALE_AUTH_KEY_ENV: &str = "TS_AUTHKEY";
+
+/// Squid rules that allow Tailscale's control plane, log service, and DERP relays.
+///
+/// `tailscaled` reaches these over HTTPS through the sandbox proxy, which is the
+/// only route out of the agent's internal network.
+const TAILSCALE_SQUID_RULES: &str = "\
+# --- tsk: added because tailscale is enabled ---
+acl tsk_tailscale_domains dstdomain .tailscale.com .tailscale.io
+acl tsk_tailscale_ports port 443
+http_access allow tsk_tailscale_domains tsk_tailscale_ports
+# --- end tsk tailscale rules ---
+";
+
+/// Builds the Squid configuration used when Tailscale is enabled.
+///
+/// The Tailscale allow rules are **prepended** to the base configuration
+/// (`base`, or the built-in default when `None`): Squid evaluates `http_access`
+/// rules in order and the default configuration ends with `http_access deny all`,
+/// so appended rules would never be reached.
+fn tailscale_squid_conf(base: Option<&str>) -> String {
+    let base = base
+        .map(|conf| conf.to_string())
+        .unwrap_or_else(default_squid_conf);
+    format!("{TAILSCALE_SQUID_RULES}\n{base}")
+}
+
+/// Returns the built-in Squid configuration embedded in the binary.
+fn default_squid_conf() -> String {
+    crate::assets::embedded::get_dockerfile_file("tsk-proxy", "squid.conf")
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .unwrap_or_default()
 }
 
 /// Proxy-specific configuration extracted from ResolvedConfig.
@@ -573,7 +886,7 @@ fn try_read_squid_conf(path: &Path) -> Option<String> {
 }
 
 /// Expand leading `~` or `~/` in a path string to the user's home directory.
-fn expand_tilde(path: &str) -> PathBuf {
+pub(crate) fn expand_tilde(path: &str) -> PathBuf {
     if path == "~" {
         if let Ok(home) = env::var("HOME").or_else(|_| env::var("USERPROFILE")) {
             return PathBuf::from(home);
@@ -1759,6 +2072,20 @@ setup = "RUN pip install numpy"
                 value: "postgres://localhost/db".to_string(),
             }],
             squid_conf: Some("http_port 3128".to_string()),
+            tailscale: true,
+            tailscale_auth_key_env: Some("MY_TS_KEY".to_string()),
+            tailscale_auth_key_file: Some("~/.config/tsk/ts-authkey".to_string()),
+            tailscale_hostname: Some("sandbox".to_string()),
+            tailscale_accept_routes: true,
+            tailscale_host_aliases: true,
+            tailscale_up_args: Some("--ssh".to_string()),
+            tailscale_api_key_env: Some("TS_API_KEY".to_string()),
+            tailscale_api_key_file: Some("~/.config/tsk/ts-api-key".to_string()),
+            tailscale_oauth_client_id: Some("kABC123".to_string()),
+            tailscale_oauth_secret_env: Some("TS_OAUTH_SECRET".to_string()),
+            tailscale_oauth_secret_file: Some("~/.config/tsk/ts-oauth-secret".to_string()),
+            tailscale_tailnet: Some("example.com".to_string()),
+            tailscale_tags: Some(vec!["tag:tsk-sandbox".to_string()]),
         };
 
         let json = serde_json::to_string(&config).unwrap();
@@ -1786,6 +2113,283 @@ setup = "RUN pip install numpy"
         assert_eq!(deserialized.env.len(), 1);
         assert_eq!(deserialized.env[0].name, "DB_URL");
         assert_eq!(deserialized.squid_conf, Some("http_port 3128".to_string()));
+        assert!(deserialized.tailscale);
+        assert_eq!(deserialized.tailscale_auth_key_env_var(), "MY_TS_KEY");
+        assert_eq!(
+            deserialized.tailscale_auth_key_file,
+            Some("~/.config/tsk/ts-authkey".to_string())
+        );
+        assert_eq!(deserialized.tailscale_hostname_for("abc123"), "sandbox");
+        assert_eq!(deserialized.tailscale_up_args, Some("--ssh".to_string()));
+        assert_eq!(
+            deserialized.tailscale_api_key_env,
+            Some("TS_API_KEY".to_string())
+        );
+        assert_eq!(
+            deserialized.tailscale_api_key_file,
+            Some("~/.config/tsk/ts-api-key".to_string())
+        );
+        assert_eq!(
+            deserialized.tailscale_oauth_client_id,
+            Some("kABC123".to_string())
+        );
+        assert_eq!(
+            deserialized.tailscale_oauth_secret_env,
+            Some("TS_OAUTH_SECRET".to_string())
+        );
+        assert_eq!(
+            deserialized.tailscale_oauth_secret_file,
+            Some("~/.config/tsk/ts-oauth-secret".to_string())
+        );
+        assert_eq!(
+            deserialized.tailscale_tailnet,
+            Some("example.com".to_string())
+        );
+        assert_eq!(
+            deserialized.tailscale_tags,
+            Some(vec!["tag:tsk-sandbox".to_string()])
+        );
+
+        // Snapshots written before Tailscale support deserialize with it off
+        let legacy: ResolvedConfig = serde_json::from_str(
+            r#"{"agent":"claude","stack":"rust","dind":false,"memory_gb":12.0,"cpu":8,
+                "git_town":false,"host_ports":[],"setup":null,"stack_config":{},
+                "agent_config":{},"volumes":[],"env":[],"squid_conf":null}"#,
+        )
+        .unwrap();
+        assert!(!legacy.tailscale);
+        assert_eq!(legacy.tailscale_auth_key_env_var(), "TS_AUTHKEY");
+        assert_eq!(legacy.tailscale_hostname_for("abc123"), "tsk-abc123");
+    }
+
+    #[test]
+    fn test_tailscale_config_layering() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let config_dir = temp_dir.path();
+
+        let toml_content = r#"
+[defaults]
+tailscale = true
+tailscale_auth_key_env = "MY_TS_KEY"
+tailscale_auth_key_file = "~/.config/tsk/ts-authkey"
+tailscale_accept_routes = true
+
+[project.private-app]
+tailscale_hostname = "private-app-sandbox"
+tailscale_up_args = "--ssh"
+
+[project.public-app]
+tailscale = false
+"#;
+        std::fs::write(config_dir.join("tsk.toml"), toml_content).unwrap();
+        let config = load_config(config_dir);
+
+        let resolved = config.resolve_config("private-app", None, None);
+        assert!(resolved.tailscale, "defaults.tailscale should propagate");
+        assert_eq!(resolved.tailscale_auth_key_env_var(), "MY_TS_KEY");
+        assert_eq!(
+            resolved.tailscale_auth_key_file,
+            Some("~/.config/tsk/ts-authkey".to_string()),
+            "defaults.tailscale_auth_key_file should propagate"
+        );
+        assert!(
+            resolved.tailscale_accept_routes,
+            "defaults.tailscale_accept_routes should propagate"
+        );
+        assert_eq!(
+            resolved.tailscale_hostname_for("abc123"),
+            "private-app-sandbox"
+        );
+        assert_eq!(resolved.tailscale_up_args, Some("--ssh".to_string()));
+
+        // Project config can turn Tailscale back off
+        let resolved = config.resolve_config("public-app", None, None);
+        assert!(!resolved.tailscale);
+
+        // Off by default with no configuration at all
+        let default_resolved = TskConfig::default().resolve_config("any", None, None);
+        assert!(!default_resolved.tailscale);
+        assert!(
+            !default_resolved.tailscale_accept_routes,
+            "accept_routes must default to false"
+        );
+        assert_eq!(default_resolved.tailscale_auth_key_env_var(), "TS_AUTHKEY");
+        assert_eq!(
+            default_resolved.tailscale_hostname_for("abc123"),
+            "tsk-abc123"
+        );
+    }
+
+    #[test]
+    fn test_tailscale_mint_config_layering() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let config_dir = temp_dir.path();
+
+        let toml_content = r#"
+[defaults]
+tailscale = true
+tailscale_oauth_client_id = "kABC123"
+tailscale_oauth_secret_env = "TS_OAUTH_SECRET"
+tailscale_tailnet = "example.com"
+tailscale_tags = ["tag:tsk-sandbox"]
+"#;
+        std::fs::write(config_dir.join("tsk.toml"), toml_content).unwrap();
+        let config = load_config(config_dir);
+
+        let resolved = config.resolve_config("any-project", None, None);
+        assert_eq!(
+            resolved.tailscale_oauth_client_id.as_deref(),
+            Some("kABC123")
+        );
+        assert_eq!(
+            resolved.tailscale_oauth_secret_env.as_deref(),
+            Some("TS_OAUTH_SECRET")
+        );
+        assert_eq!(resolved.tailscale_tailnet.as_deref(), Some("example.com"));
+        assert_eq!(
+            resolved.tailscale_tags,
+            Some(vec!["tag:tsk-sandbox".to_string()])
+        );
+        // Unset PAT fields stay None.
+        assert!(resolved.tailscale_api_key_env.is_none());
+        assert!(resolved.tailscale_api_key_file.is_none());
+    }
+
+    #[test]
+    fn test_has_tailscale_mint_credential() {
+        let none = ResolvedConfig::default();
+        assert!(!none.has_tailscale_mint_credential());
+
+        let pat = ResolvedConfig {
+            tailscale_api_key_env: Some("TS_API_KEY".to_string()),
+            ..Default::default()
+        };
+        assert!(pat.has_tailscale_mint_credential());
+
+        let oauth = ResolvedConfig {
+            tailscale_oauth_client_id: Some("kABC".to_string()),
+            ..Default::default()
+        };
+        assert!(oauth.has_tailscale_mint_credential());
+
+        let oauth_secret_only = ResolvedConfig {
+            tailscale_oauth_secret_env: Some("TS_OAUTH_SECRET".to_string()),
+            ..Default::default()
+        };
+        assert!(oauth_secret_only.has_tailscale_mint_credential());
+    }
+
+    #[test]
+    fn test_tailscale_tailnet_and_tags_defaults() {
+        let resolved = ResolvedConfig::default();
+        assert_eq!(resolved.tailscale_tailnet(), "-");
+        assert_eq!(
+            resolved.tailscale_tags(),
+            vec!["tag:tsk-sandbox".to_string()]
+        );
+
+        let custom = ResolvedConfig {
+            tailscale_tailnet: Some("example.com".to_string()),
+            tailscale_tags: Some(vec!["tag:ci".to_string()]),
+            ..Default::default()
+        };
+        assert_eq!(custom.tailscale_tailnet(), "example.com");
+        assert_eq!(custom.tailscale_tags(), vec!["tag:ci".to_string()]);
+    }
+
+    #[test]
+    fn test_validate_tailscale_up_args() {
+        // Benign flags pass, including empty
+        assert!(validate_tailscale_up_args("").is_ok());
+        assert!(validate_tailscale_up_args("--ssh").is_ok());
+        assert!(validate_tailscale_up_args("--advertise-tags=tag:ci --ssh").is_ok());
+
+        // Isolation-weakening flags are rejected in `--flag=x`, `--flag x`, AND
+        // single-dash `-flag` forms (Tailscale's parser treats -/-- alike).
+        for bad in [
+            "--exit-node=100.64.0.1",
+            "--exit-node 100.64.0.1",
+            "-exit-node=100.64.0.1",
+            "-accept-routes",
+            "--advertise-routes=10.0.0.0/8",
+            "-advertise-routes=10.0.0.0/8",
+            "--advertise-exit-node",
+            "--accept-routes",
+            "--accept-dns=true",
+            "--netfilter-mode=off",
+            "--ssh --exit-node=x",
+        ] {
+            let err = validate_tailscale_up_args(bad).unwrap_err();
+            assert!(err.contains("network isolation"), "{bad} -> {err}");
+        }
+    }
+
+    #[test]
+    fn test_expand_tilde() {
+        use std::path::PathBuf;
+        if let Ok(home) = env::var("HOME").or_else(|_| env::var("USERPROFILE")) {
+            assert_eq!(expand_tilde("~"), PathBuf::from(&home));
+            assert_eq!(
+                expand_tilde("~/ts-authkey"),
+                PathBuf::from(&home).join("ts-authkey")
+            );
+        }
+        // Non-tilde paths pass through unchanged
+        assert_eq!(expand_tilde("/abs/path"), PathBuf::from("/abs/path"));
+        assert_eq!(expand_tilde("rel/path"), PathBuf::from("rel/path"));
+    }
+
+    #[test]
+    fn test_tailscale_hostname_sanitized() {
+        // Task IDs may contain `_`/uppercase; Tailscale rewrites those, so tsk
+        // sanitizes to match what actually registers on the tailnet.
+        let cfg = ResolvedConfig::default();
+        assert_eq!(cfg.tailscale_hostname_for("Ab_9Xy"), "tsk-ab-9xy");
+        // Custom hostnames are sanitized too.
+        let custom = ResolvedConfig {
+            tailscale_hostname: Some("My_Box!".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(custom.tailscale_hostname_for("zzz"), "my-box");
+    }
+
+    #[test]
+    fn test_proxy_config_allows_tailscale_domains_when_enabled() {
+        let disabled = ResolvedConfig::default();
+        assert!(disabled.proxy_config().squid_conf.is_none());
+
+        // With no custom squid.conf, the built-in config is extended
+        let enabled = ResolvedConfig {
+            tailscale: true,
+            ..Default::default()
+        };
+        let conf = enabled.proxy_config().squid_conf.unwrap();
+        assert!(conf.contains("http_access allow tsk_tailscale_domains"));
+        assert!(conf.contains(".tailscale.com"));
+        assert!(
+            conf.contains("http_port 3128"),
+            "built-in squid.conf should still be present"
+        );
+
+        // Custom configuration is preserved, with the allow rules ahead of it so
+        // they are evaluated before any deny rule
+        let custom = ResolvedConfig {
+            tailscale: true,
+            squid_conf: Some("http_port 3128\nhttp_access deny all".to_string()),
+            ..Default::default()
+        };
+        let conf = custom.proxy_config().squid_conf.unwrap();
+        assert!(conf.ends_with("http_port 3128\nhttp_access deny all"));
+        assert!(
+            conf.find("tsk_tailscale_domains").unwrap()
+                < conf.find("http_access deny all").unwrap()
+        );
+
+        // Tailscale tasks get their own proxy container
+        assert_ne!(
+            enabled.proxy_config().fingerprint(),
+            disabled.proxy_config().fingerprint()
+        );
     }
 
     #[test]

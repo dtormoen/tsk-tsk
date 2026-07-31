@@ -99,6 +99,8 @@ RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 {{{PROJECT}}}
 # End of Project layer
 
+{{{TAILSCALE}}}
+
 {{{SUDO}}}
 
 # Build arguments for git configuration
