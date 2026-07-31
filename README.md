@@ -453,6 +453,60 @@ tsk run --tailscale -t feat -n sync-schema -p "Sync the schema from the staging 
 
 **Cleanup of sandbox nodes.** Each sandbox joins as a `tsk-<task-id>` node. To keep the admin console from filling up with old nodes, the node must be **ephemeral** — Tailscale then auto-removes it a few minutes after the sandbox stops. The most robust way is to let tsk **mint the key**: configure a Tailscale API credential (a one-click **personal access token**, or an **OAuth client** for non-expiring, tightly-scoped access, via `tailscale_api_key_env` / `tailscale_oauth_client_id`) and tsk creates a fresh single-use, ephemeral, tagged key per task — so nodes are always tagged (`tag:tsk-sandbox` by default) and always auto-remove, with no way to misconfigure them. There's no default env var for the mint credential — minting only kicks in once you configure one of the fields above. If you instead bring your own key (`TS_AUTHKEY` / `tailscale_auth_key_file`), you are responsible for making it **ephemeral and tagged**; a non-ephemeral or untagged key leaves nodes behind and attributes them to your personal identity (the sandbox prints a warning when it detects an untagged node). A manually-generated reusable key remains a practical fallback, but minting is the robust, hands-off option.
 
+#### Scope the sandbox tag with a least-privilege ACL
+
+The sandboxed agent is untrusted and holds `NET_ADMIN`, so **your Tailscale ACL and the `tag:tsk-sandbox` tag are the real security boundary — not tsk's flags.** Before your first Tailscale task, define the tag and scope it tightly.
+
+Tailscale ACLs are **default-deny**: a freshly-tagged `tag:tsk-sandbox` node can reach *nothing* on your tailnet until a rule grants it. The failure mode to guard against is the opposite — an existing **broad** rule (`src: ["*"]`, or an `autogroup` that covers the tag) silently handing every sandbox your whole tailnet. So the job is: grant the tag only the few hosts/ports an agent needs, and make sure no wildcard rule already covers it.
+
+A minimal, default-deny policy (HuJSON, Tailscale admin console → Access Controls):
+
+```jsonc
+{
+  "tagOwners": {
+    // Who may mint/assign keys for the sandbox tag. A PAT's user must be an
+    // owner to mint with a PAT; an OAuth client is granted this tag when you
+    // create it, and the tag must be defined here either way.
+    "tag:tsk-sandbox": ["autogroup:admin"],
+  },
+
+  "acls": [
+    // Grant the sandbox ONLY what agents actually need — enumerate dst
+    // host:port explicitly. Everything else is denied by default.
+    {
+      "action": "accept",
+      "src":    ["tag:tsk-sandbox"],
+      "dst":    ["tag:staging-db:5432", "tag:internal-api:443"],
+    },
+
+    // ...your other rules...
+    // ⚠️  Audit every broad rule: a line like
+    //     { "action": "accept", "src": ["*"], "dst": ["*:*"] }
+    // (or any autogroup that includes tagged nodes) would give every sandbox
+    // your entire tailnet. Exclude tag:tsk-sandbox from such rules.
+  ],
+
+  // Do NOT grant the sandbox tag SSH access unless you specifically intend to.
+  "ssh": [],
+}
+```
+
+**Best-practices checklist:**
+
+- **Always tag, never personal.** Use `tag:tsk-sandbox` (or your own tag via `tailscale_tags`); an untagged key gives the sandbox your full personal tailnet access.
+- **Default-deny, enumerate up.** Grant the tag only specific `dst` `host:port`s. Don't reuse a broad "allow internal" rule for it.
+- **Prefer minting.** A minted key is ephemeral, single-use, and always tagged, so nodes auto-remove and can't be misconfigured. For bring-your-own keys, set an **ephemeral, tagged** key with a sensible expiry and rotate it.
+- **Scope the mint credential.** Give the **OAuth client** only the `auth_keys` scope plus ownership of `tag:tsk-sandbox`; give a **PAT** a short expiry and rotate it. The credential stays on the trusted host, never in the sandbox.
+- **Keep routes off.** Leave `tailscale_accept_routes` at its default `false` unless a task genuinely needs a whole subnet — accepted routes bypass the Squid allowlist.
+- **No SSH/exit-node for the tag.** tsk already rejects exit-node/route-advertising flags; don't re-add reachability through your ACL.
+
+**Quick start:**
+
+1. Add `tag:tsk-sandbox` to `tagOwners` and a narrow `acls` grant (above).
+2. Create a mint credential: a **PAT** (admin console → *Settings → Keys → Generate access token*) or an **OAuth client** scoped to `auth_keys` + `tag:tsk-sandbox`.
+3. Expose it and point tsk at it — `export TS_API_KEY=tskey-api-...` with `tailscale_api_key_env = "TS_API_KEY"` (or the `tailscale_oauth_*` fields).
+4. Run a task: `tsk run --tailscale -t feat -n sync-schema -p "Sync the staging schema"`.
+
 How it works:
 
 - `tsk` installs `tailscale`/`tailscaled` in the sandbox image and starts them before the agent runs. If the tailnet cannot be joined within 60s the task fails rather than running without access.
