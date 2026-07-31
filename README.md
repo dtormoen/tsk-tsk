@@ -459,6 +459,8 @@ The sandboxed agent is untrusted and holds `NET_ADMIN`, so **your Tailscale ACL 
 
 Tailscale ACLs are **default-deny**: a freshly-tagged `tag:tsk-sandbox` node can reach *nothing* on your tailnet until a rule grants it. The failure mode to guard against is the opposite — an existing **broad** rule (`src: ["*"]`, or an `autogroup` that covers the tag) silently handing every sandbox your whole tailnet. So the job is: grant the tag only the few hosts/ports an agent needs, and make sure no wildcard rule already covers it.
 
+**Scope by tag, never by hostname.** Write rules against `tag:tsk-sandbox`, not against the `tsk-<task-id>` node name. Tailscale ACLs cannot match a hostname prefix like `tsk-*` at all — `src`/`dst` accept tags, users, groups, autogroups, hosts, and IPs, not name globs. The hostname is also only cosmetic and **is modifiable**: it defaults to `tsk-<task-id>` but you can override it per task with `tailscale_hostname` (names are sanitized to a DNS-safe form). The **tag**, by contrast, is applied by tsk to every minted key and can't be changed by the sandbox, so it's the only reliable anchor — a renamed node keeps its tag and therefore its ACL scope. (If you bring your own key instead of minting, *you* are responsible for tagging it; an untagged node has no tag to scope, which is why tsk warns about it.)
+
 A minimal, default-deny policy (HuJSON, Tailscale admin console → Access Controls):
 
 ```jsonc
