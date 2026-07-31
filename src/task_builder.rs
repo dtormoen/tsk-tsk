@@ -1502,10 +1502,7 @@ mod tests {
             .await;
 
         let err = result.expect_err("build should reject --exit-node in up_args");
-        assert!(
-            err.to_string().contains("network isolation"),
-            "got: {err}"
-        );
+        assert!(err.to_string().contains("network isolation"), "got: {err}");
     }
 
     #[tokio::test]
@@ -1527,10 +1524,7 @@ mod tests {
             .await;
 
         let err = result.expect_err("tailscale without network isolation should fail");
-        assert!(
-            err.to_string().contains("network isolation"),
-            "got: {err}"
-        );
+        assert!(err.to_string().contains("network isolation"), "got: {err}");
     }
 
     #[tokio::test]
