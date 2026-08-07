@@ -26,7 +26,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 anyhow = "1.0"
 git2 = { version = "0.20.4", default-features = false }
-notify-rust = "4.12"
+notify-rust = "4.16"
 thiserror = "2.0"
 libc = "0.2"
 is-terminal = "0.4"
