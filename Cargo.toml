@@ -34,7 +34,7 @@ termion = "4.0"
 rust-embed = { version = "8.11", features = ["debug-embed"] }
 tempfile = "3.27"
 tar = "0.4"
-nanoid = "0.4"
+nanoid = "0.5"
 bytes = "1.11"
 http-body-util = "0.1"
 handlebars = "6.4"
